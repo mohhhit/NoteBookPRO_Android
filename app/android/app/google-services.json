@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "26052677132",
+    "project_id": "notebookpro-7edc0",
+    "storage_bucket": "notebookpro-7edc0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:26052677132:android:df259dd28e4a3e81996829",
+        "android_client_info": {
+          "package_name": "com.example.notebook_pro_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyADjMj1OuYwvewfbzFkhcDYeheWBwVW3_U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
