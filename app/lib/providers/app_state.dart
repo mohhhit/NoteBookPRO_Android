@@ -10,6 +10,7 @@ import '../services/document_processor.dart';
 import '../services/vector_db_service.dart';
 import '../services/studio_service.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter/foundation.dart';
 
 class AppState extends ChangeNotifier with WindowListener {
   // Current state
@@ -273,7 +274,14 @@ class AppState extends ChangeNotifier with WindowListener {
       List<String> contextChunks = [];
       try {
         final results = await VectorDbService.query(_currentSpace!.id, query, nResults: 5);
-        contextChunks = results.map((e) => e['content'] as String).toList();
+        for (int i = 0; i < results.length; i++) {
+          final result = results[i];
+          final content = result['content'] as String;
+          final metadata = result['metadata'] as Map<String, dynamic>;
+          final year = metadata['publication_year'] ?? '0000';
+          final filename = metadata['virtual_filename'] ?? 'unknown';
+          contextChunks.add('Source [${i + 1}] [YEAR: $year] ($filename):\n$content');
+        }
       } catch (e) {
         print('Vector DB Query failed: $e');
       }
@@ -357,28 +365,28 @@ class AppState extends ChangeNotifier with WindowListener {
     WakelockPlus.enable();
     
     try {
-      final processor = DocumentProcessor();
-      
       for (int i = 0; i < files.length; i++) {
         final file = files[i];
         if (file.path == null) continue;
         
-        _uploadStatus = 'Reading ${file.name} (${i + 1}/${files.length})...';
+        _uploadStatus = 'Extracting ${file.name} (${i + 1}/${files.length})...';
         notifyListeners();
         
-        // Yield to let UI update
+        // Let UI update
         await Future.delayed(const Duration(milliseconds: 10));
 
+        // 1. Extract text via Native Platform Channel (ReadPdfText) -> Avoids Dart Heap OOM
+        final processor = DocumentProcessor();
         final fileData = await processor.processFile(file.path!);
         final content = fileData['content'] as String;
         final virtualFilename = fileData['virtual_filename'] as String;
-        
-        _uploadStatus = 'Chunking text...';
-        notifyListeners();
-        await Future.delayed(const Duration(milliseconds: 10));
-        
-        // Chunk
-        final chunks = processor.chunkText(content, sourceFilename: virtualFilename);
+        fileData.remove('content'); // free immediately
+
+        // 2. Offload heavy string manipulation (chunking) to background isolate
+        final chunks = await compute(chunkTextTask, {
+          'content': content,
+          'virtualFilename': virtualFilename,
+        });
         
         // Formulate metadata
         final metadatas = chunks.map((_) => {
@@ -393,7 +401,7 @@ class AppState extends ChangeNotifier with WindowListener {
           chunks, 
           metadatas,
           onProgress: (current, total) {
-            _uploadStatus = 'Embedding chunk $current of $total...';
+            _uploadStatus = 'Indexing chunk $current of $total...';
             notifyListeners();
           }
         );
@@ -494,3 +502,4 @@ class AppState extends ChangeNotifier with WindowListener {
     notifyListeners();
   }
 }
+

@@ -1,7 +1,13 @@
 import 'dart:io';
-import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:flutter/foundation.dart';
+import 'package:read_pdf_text/read_pdf_text.dart';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
+
+List<String> chunkTextTask(Map<String, String> data) {
+  final processor = DocumentProcessor();
+  return processor.chunkText(data['content']!, sourceFilename: data['virtualFilename']);
+}
 
 class DocumentProcessor {
   final List<String> supportedFormats = ['.pdf', '.txt', '.docx'];
@@ -54,11 +60,7 @@ class DocumentProcessor {
     }
 
     try {
-      final bytes = await file.readAsBytes();
-      final document = PdfDocument(inputBytes: bytes);
-      final textExtractor = PdfTextExtractor(document);
-      final text = textExtractor.extractText();
-      document.dispose();
+      final text = await ReadPdfText.getPDFtext(file.path);
       return _cleanText(text);
     } catch (e) {
       throw Exception('Could not extract text from PDF: $e');
