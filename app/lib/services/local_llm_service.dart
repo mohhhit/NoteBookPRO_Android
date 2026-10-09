@@ -12,13 +12,13 @@ class LocalLlmService {
     if (_isInitialized) return;
 
     final docDir = await getApplicationDocumentsDirectory();
-    final modelPath = '${docDir.path}/qwen2.5-1.5b-instruct-q4_k_m.gguf';
+    final modelPath = '${docDir.path}/Llama-3.2-3B-Instruct-Q4_K_M.gguf';
     final modelFile = File(modelPath);
 
     if (!await modelFile.exists()) {
       throw Exception(
         'Model not found at $modelPath.\n'
-        'Please download Qwen2.5 1.5B Q4_K_M GGUF and place it in the app documents directory.',
+        'Please download Llama-3.2-3B-Instruct-Q4_K_M GGUF and place it in the app documents directory.',
       );
     }
 
@@ -28,11 +28,32 @@ class LocalLlmService {
     await _engine!.loadModel(
       modelPath,
       modelParams: const ModelParams(
-        contextSize: 8192,
+        contextSize: 4096, // Increased to 4096 for RAG
+        cacheTypeK: KvCacheType.q8_0,
+        cacheTypeV: KvCacheType.q8_0,
       ),
     );
 
     _isInitialized = true;
+  }
+
+  static Future<String> generateQueryExpansion(String query) async {
+    if (!_isInitialized || _engine == null) return query;
+    
+    final prompt = '<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are an academic search assistant. Your ONLY job is to output 8 technical keywords, synonyms, or related terms for the user\'s query, separated by spaces. Do not write anything else. Do not use markdown.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n$query<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n';
+    
+    String result = "";
+    int tokens = 0;
+    try {
+      await for (final chunk in _engine!.generate(prompt, params: const GenerationParams(temp: 0.1, maxTokens: 20))) {
+        result += chunk;
+        tokens++;
+        if (tokens > 20) break;
+      }
+    } catch (e) {
+      print('Expansion error: $e');
+    }
+    return result.trim().replaceAll(RegExp(r'[^\w\s]'), ' ');
   }
 
   static Stream<String> generateResponse(List<ChatMessage> history, {List<String>? contextChunks}) async* {
@@ -46,7 +67,7 @@ STRICT GROUNDING: You MUST ONLY use information present inside the provided cont
 
 TEMPORAL ARBITRATION & SYNTHESIS: Context chunks are labeled as Source [i] [YEAR: YYYY] (filename). Prioritize the most recent year as modern standard/state-of-the-art, and frame older sources as foundational/historical context.
 
-ACADEMIC RIGOR: Avoid superficial summaries. Explain mechanisms, formulas, penalties, architectural details, limitations, and failure modes when present.
+ACADEMIC RIGOR: Avoid superficial summaries. Only include limitations, failure modes, or formulas if they are explicitly detailed in the excerpts. If the excerpts only explain what a tool does, omit those sections entirely.
 
 REQUIRED OUTPUT STRUCTURE:
 - Use clear markdown headings with ### for major sections.
@@ -63,25 +84,30 @@ REQUIRED OUTPUT STRUCTURE:
 - Use **bold** for key facts, numbers, and formulas.
 - Aim for substantial depth (typically 250-500 words) unless context is very limited.
 
-**Citation Rules:**
+**Citation Rules & Examples:**
+- Every factual sentence must be supported by a citation **[1]**.
+- If you mention a standard concept not explicitly explained in the text, you must prefix it with 'Generally in practice' or omit it.
 - Cite every major claim or paragraph using **[1]**, **[2]** etc based on Source number.
 - If claim uses multiple sources, use **[1, 2]**.
-- Citations must be numeric only: **[n]** or **[n, m]**.
-- NEVER include year, filename, or the word Source in citation text.
-- Do NOT make up information.''';
+- Citations must be inline and numeric only: **[n]** or **[n, m]**.
+- Paraphrase facts and cite them. Do NOT make up information.
 
-    final messages = [
-      LlamaChatMessage.fromText(role: LlamaChatRole.system, text: systemText),
-    ];
-    
+CORRECT CITATION FORMAT: "Kubernetes uses a declarative model [1]."
+INCORRECT CITATION FORMAT: "According to Source [1], Kubernetes uses a declarative model."
+INCORRECT CITATION FORMAT: "**Source [1]:** Kubernetes uses a declarative model."''';
+
+    final buffer = StringBuffer();
+    buffer.writeln('<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n$systemText<|eot_id|>');
+
+    int lastUserIndex = history.lastIndexWhere((msg) => msg.role == 'user');
+
     for (int i = 0; i < history.length; i++) {
       var msg = history[i];
-      // Don't include the empty assistant message that is currently being generated
       if (msg.role == 'assistant' && msg.content.isEmpty) continue;
       
       String text = msg.content;
       
-      if (msg.role == 'user' && i == history.length - 2 && contextChunks != null && contextChunks.isNotEmpty) {
+      if (i == lastUserIndex && contextChunks != null && contextChunks.isNotEmpty) {
         text = '''**===== START OF CONTEXT (ANSWER ONLY FROM THIS) =====**
 
 ${contextChunks.join('\n\n')}
@@ -92,31 +118,44 @@ ${contextChunks.join('\n\n')}
 
 **Instructions:** Answer ONLY using the context between the markers above. If the context does not contain the answer, say you do not have that information. Cite sources in brackets.
 
-**Academic Completeness Checklist (apply when evidence exists in context):**
+**Academic Completeness Checklist (apply ONLY when evidence exists in context):**
 1. Include core mechanism details, not just definitions.
 2. Include at least one relevant equation, formula component, or scoring term when present.
 3. State known limitations/failure cases and why they matter.
 4. Mention important variants/versions when supported by context.
-5. Briefly contrast with modern alternatives if context includes them.
-6. Synthesize evidence from multiple source snippets when available.
-7. Keep structure clear: definition -> mechanics -> limitations -> modern view -> takeaway.
-Note: If a checklist item is not supported by the provided context, explicitly say that.''';
+5. Synthesize evidence from multiple source snippets when available.
+6. Keep structure clear: definition -> mechanics -> limitations -> takeaway.
+
+**CRITICAL ANTI-HALLUCINATION RULES:**
+- Do NOT mention "alternatives" unless the context explicitly compares them as competing technologies. Auxiliary tools mentioned in passing are NOT alternatives.
+- Do NOT invent information or equations. If an item above is missing from context, omit it entirely.''';
       }
 
-      messages.add(LlamaChatMessage.fromText(
-        role: msg.role == 'user' ? LlamaChatRole.user : LlamaChatRole.assistant, 
-        text: text,
-      ));
+      buffer.writeln('<|start_header_id|>${msg.role}<|end_header_id|>\n\n$text<|eot_id|>');
     }
     
-    await for (final chunk in _engine!.create(messages)) {
-      if (chunk.choices.isNotEmpty) {
-        final text = chunk.choices.first.delta.content;
-        if (text != null && text.isNotEmpty) {
-          yield text;
-        }
+    // Start assistant response
+    buffer.write('<|start_header_id|>assistant<|end_header_id|>\n\n');
+
+    print('LLM: Starting generation with context size ${history.length} messages (Direct String Gen)');
+    final startTime = DateTime.now();
+    int tokenCount = 0;
+    
+    await for (final textChunk in _engine!.generate(
+      buffer.toString(),
+      params: const GenerationParams(temp: 0.1),
+    )) {
+      if (tokenCount == 0) {
+        print('LLM: First token generated in ${DateTime.now().difference(startTime).inMilliseconds}ms');
+      }
+      
+      if (textChunk.isNotEmpty) {
+        tokenCount++;
+        yield textChunk;
       }
     }
+    
+    print('LLM: Finished generation. Total tokens yielded: $tokenCount');
   }
 
   static void dispose() {

@@ -340,7 +340,10 @@ class _HomePageState extends State<HomePage> {
                               right: BorderSide(color: Color(0xFF2D2D2D)),
                             ),
                           ),
-                          child: _buildSidebar(appState, isMobile: false),
+                          child: Material(
+                            type: MaterialType.transparency,
+                            child: _buildSidebar(appState, isMobile: false),
+                          ),
                         ),
 
                       // Main content
@@ -557,7 +560,10 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                                   right: BorderSide(color: Color(0xFF2D2D2D)),
                                 ),
                               ),
-                              child: _buildSidebar(appState, isMobile: true),
+                              child: Material(
+                                type: MaterialType.transparency,
+                                child: _buildSidebar(appState, isMobile: true),
+                              ),
                             ),
                           ),
                         ],

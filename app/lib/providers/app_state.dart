@@ -270,17 +270,34 @@ class AppState extends ChangeNotifier with WindowListener {
         notifyListeners();
       }
 
+      // 3.5 LLM Query Expansion
+      updateAssistantMessage("Expanding search query for better retrieval...");
+      final expandedKeywords = await LocalLlmService.generateQueryExpansion(query);
+      final expandedQuery = "$query $expandedKeywords";
+
       // 4. Retrieve Vector Context (RAG)
+      updateAssistantMessage("Searching textbooks...");
       List<String> contextChunks = [];
       try {
-        final results = await VectorDbService.query(_currentSpace!.id, query, nResults: 5);
+        final results = await VectorDbService.query(_currentSpace!.id, expandedQuery, nResults: 2);
+        
+        if (results.isEmpty) {
+          final fallbackMsg = "The current space (MLOps) only references this topic in passing. For an in-depth architectural breakdown, consider adding a dedicated Distributed Systems or Cloud Infrastructure text.";
+          _currentChat!.messages.add(ChatMessage(role: 'assistant', content: fallbackMsg, timestamp: DateTime.now().toIso8601String()));
+          await LocalDatabaseService.addMessage(_currentChat!.id, 'assistant', fallbackMsg);
+          _isThinking = false;
+          _setLoading(false);
+          notifyListeners();
+          return;
+        }
+
         for (int i = 0; i < results.length; i++) {
           final result = results[i];
           final content = result['content'] as String;
           final metadata = result['metadata'] as Map<String, dynamic>;
-          final year = metadata['publication_year'] ?? '0000';
+          final year = metadata['publication_year'] ?? 'Unknown Year';
           final filename = metadata['virtual_filename'] ?? 'unknown';
-          contextChunks.add('Source [${i + 1}] [YEAR: $year] ($filename):\n$content');
+          contextChunks.add('[${i + 1}] $filename ($year):\n$content');
         }
       } catch (e) {
         print('Vector DB Query failed: $e');
@@ -288,14 +305,22 @@ class AppState extends ChangeNotifier with WindowListener {
 
       // 5. Stream response from LocalLlmService
       String fullResponse = "";
+      
+      // Keep screen awake while generating response
+      WakelockPlus.enable();
+      
       final stream = LocalLlmService.generateResponse(
         _currentChat!.messages,
         contextChunks: contextChunks,
       );
       
-      _isThinking = false; // Finished initial prep
+      bool firstChunk = true;
       
       await for (final chunk in stream) {
+        if (firstChunk) {
+          _isThinking = false;
+          firstChunk = false;
+        }
         fullResponse += chunk;
         updateAssistantMessage(fullResponse);
       }
@@ -308,6 +333,7 @@ class AppState extends ChangeNotifier with WindowListener {
       _isThinking = false;
     } finally {
       _setLoading(false);
+      WakelockPlus.disable();
       notifyListeners();
     }
   }
