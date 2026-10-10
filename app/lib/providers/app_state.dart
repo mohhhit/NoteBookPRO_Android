@@ -271,19 +271,17 @@ class AppState extends ChangeNotifier with WindowListener {
       }
 
       // 3.5 LLM Query Expansion
-      updateAssistantMessage("Expanding search query for better retrieval...");
       final expandedKeywords = await LocalLlmService.generateQueryExpansion(query);
       final expandedQuery = "$query $expandedKeywords";
 
       // 4. Retrieve Vector Context (RAG)
-      updateAssistantMessage("Searching textbooks...");
       List<String> contextChunks = [];
       try {
-        final results = await VectorDbService.query(_currentSpace!.id, expandedQuery, nResults: 2);
+        final results = await VectorDbService.query(_currentSpace!.id, expandedQuery, nResults: 12);
         
         if (results.isEmpty) {
-          final fallbackMsg = "The current space (MLOps) only references this topic in passing. For an in-depth architectural breakdown, consider adding a dedicated Distributed Systems or Cloud Infrastructure text.";
-          _currentChat!.messages.add(ChatMessage(role: 'assistant', content: fallbackMsg, timestamp: DateTime.now().toIso8601String()));
+          final fallbackMsg = "The current space only references this topic in passing. For an in-depth architectural breakdown, consider adding a dedicated textbook.";
+          updateAssistantMessage(fallbackMsg);
           await LocalDatabaseService.addMessage(_currentChat!.id, 'assistant', fallbackMsg);
           _isThinking = false;
           _setLoading(false);
@@ -291,13 +289,39 @@ class AppState extends ChangeNotifier with WindowListener {
           return;
         }
 
-        for (int i = 0; i < results.length; i++) {
-          final result = results[i];
+        // Compress chunks to best 2 sentences
+        String compressChunk(String chunk, String q) {
+          final sentences = chunk.split(RegExp(r'(?<=[.!?])\s+'));
+          if (sentences.length <= 2) return chunk.trim();
+          
+          final queryWords = q.toLowerCase().split(RegExp(r'\s+')).where((w) => w.length > 3).toSet();
+          if (queryWords.isEmpty) return sentences.take(2).join(' ').trim();
+
+          final scoredSentences = sentences.map((s) {
+            int score = queryWords.where((w) => s.toLowerCase().contains(w)).length;
+            return {'text': s, 'score': score};
+          }).toList();
+          
+          scoredSentences.sort((a, b) => (b['score'] as int).compareTo(a['score'] as int));
+          return scoredSentences.take(2).map((e) => (e['text'] as String).trim()).join(' ');
+        }
+
+        // Group by filename to avoid redundant labels
+        final groupedChunks = <String, List<String>>{};
+        for (final result in results) {
           final content = result['content'] as String;
           final metadata = result['metadata'] as Map<String, dynamic>;
           final year = metadata['publication_year'] ?? 'Unknown Year';
           final filename = metadata['virtual_filename'] ?? 'unknown';
-          contextChunks.add('[${i + 1}] $filename ($year):\n$content');
+          final label = '$filename ($year)';
+          
+          groupedChunks.putIfAbsent(label, () => []);
+          groupedChunks[label]!.add(compressChunk(content, expandedQuery));
+        }
+
+        int sourceIndex = 1;
+        for (final entry in groupedChunks.entries) {
+          contextChunks.add('[${sourceIndex++}] ${entry.key}:\n- ${entry.value.join('\n- ')}');
         }
       } catch (e) {
         print('Vector DB Query failed: $e');
@@ -309,8 +333,10 @@ class AppState extends ChangeNotifier with WindowListener {
       // Keep screen awake while generating response
       WakelockPlus.enable();
       
+      // Pass a sliced history so the empty aiMsg doesn't leak into the prompt
+      final historyForLlm = _currentChat!.messages.sublist(0, _currentChat!.messages.length - 1);
       final stream = LocalLlmService.generateResponse(
-        _currentChat!.messages,
+        historyForLlm,
         contextChunks: contextChunks,
       );
       
@@ -324,6 +350,42 @@ class AppState extends ChangeNotifier with WindowListener {
         fullResponse += chunk;
         updateAssistantMessage(fullResponse);
       }
+
+      // --- Post-Generation Citation Check ---
+      // Drop any non-heading sentence that lacks a citation to enforce strict grounding.
+      final lines = fullResponse.split('\n');
+      final sanitizedLines = <String>[];
+      
+      for (final line in lines) {
+        if (line.trim().isEmpty) {
+          sanitizedLines.add(line);
+          continue;
+        }
+        
+        // Keep Markdown headings and tables unconditionally
+        if (line.trimLeft().startsWith('#') || line.trimLeft().startsWith('|')) {
+          sanitizedLines.add(line);
+          continue;
+        }
+        
+        final sentences = line.split(RegExp(r'(?<=[.!?])\s+'));
+        final validSentences = sentences.where((s) {
+          if (s.trim().isEmpty) return false;
+          return RegExp(r'\[\d+\]').hasMatch(s);
+        }).toList();
+        
+        if (validSentences.isNotEmpty) {
+          // If the original line was a bullet, and we dropped the first sentence, restore the bullet
+          var joined = validSentences.join(' ');
+          if (line.trimLeft().startsWith(RegExp(r'[-*]\s')) && !joined.trimLeft().startsWith(RegExp(r'[-*]\s'))) {
+            joined = '- $joined';
+          }
+          sanitizedLines.add(joined);
+        }
+      }
+      
+      fullResponse = sanitizedLines.join('\n');
+      updateAssistantMessage(fullResponse);
 
       // 5. Save the AI message to DB once done
       await LocalDatabaseService.addMessage(_currentChat!.id, 'assistant', fullResponse);

@@ -114,6 +114,12 @@ class DocumentProcessor {
     // Normalize line endings
     var t = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
     
+    // Fix hyphenated word breaks at end of line (e.g. "lightweig-\nht" -> "lightweight")
+    t = t.replaceAll(RegExp(r'-\n\s*'), '');
+    
+    // Join lines that are part of the same paragraph (single newline to space)
+    t = t.replaceAll(RegExp(r'(?<!\n)\n(?!\n)'), ' ');
+    
     // Keep paragraph boundaries; collapse inner spaces/tabs only.
     t = t.replaceAll(RegExp(r'[ \t]+'), ' ');
     
@@ -143,15 +149,13 @@ class DocumentProcessor {
 
   List<String> chunkText(
     String text, {
-    int chunkSize = 450,
-    int overlap = 80,
+    int chunkSize = 2000,
+    int overlap = 200,
     bool semantic = true,
     String? sourceFilename,
   }) {
     final rawChunks = _recursiveSplit(text, chunkSize, overlap);
-    final prefix = sourceFilename != null ? 'Source Document: $sourceFilename\n---\n' : '';
-    
-    return rawChunks.map((chunk) => prefix + chunk.trim()).toList();
+    return rawChunks.map((chunk) => chunk.trim()).toList();
   }
 
   List<String> _recursiveSplit(String text, int chunkSize, int overlap) {
