@@ -89,7 +89,8 @@ class VectorDbService {
     final bookCount = <String, int>{};
 
     final bestBm25 = -(candidates.first['score'] as num).toDouble();
-    final relevanceFloor = (bestBm25 * 0.25).clamp(1.5, double.infinity);
+    // Clamp relevance floor so high BM25 in intro chapters doesn't eliminate technical chapters
+    final relevanceFloor = (bestBm25 * 0.15).clamp(2.0, 5.0);
     print('RAG: Best BM25 = $bestBm25, Relevance Floor = $relevanceFloor');
 
     final validCandidates = candidates.where((c) {
@@ -97,15 +98,30 @@ class VectorDbService {
       if (bm25 < relevanceFloor) return false;
       
       final content = (c['content'] as String).toLowerCase();
+
+      // Filter out Table of Contents, Index, and Front Matter
+      if (content.contains('table of contents') || content.contains('contents at a glance')) return false;
+      if (RegExp(r'chapter\s+\d+.*chapter\s+\d+', dotAll: true).hasMatch(content)) return false;
+      if (RegExp(r'\.{3,}\s*\d+').allMatches(content).length >= 2) return false;
+      if (content.contains('index') && RegExp(r'\b\d{2,3},\s*\d{2,3}\b').hasMatch(content)) return false;
+      if (content.contains('all rights reserved') && content.contains('isbn')) return false;
+      if (RegExp(r'covered in chapter \d+|discussed in chapter \d+|detail in chapter \d+').hasMatch(content) && content.length < 350) return false;
+
       int proceduralScore = 0;
-      if (content.contains('run the following command')) proceduralScore += 2;
-      if (content.contains('apt-get install') || content.contains('yum install') || content.contains('snap install') || content.contains('brew install')) proceduralScore += 2;
-      if (RegExp(r'\$\s+[a-z]').allMatches(content).length >= 2) proceduralScore += 2;
+      if (content.contains('run the following command') || content.contains('run this command')) proceduralScore += 2;
+      if (content.contains('apt-get install') || content.contains('yum install') || content.contains('snap install') || content.contains('brew install')) proceduralScore += 3;
+      if (content.contains('sudo apt') || content.contains('sudo yum') || content.contains('sudo dnf') || content.contains('sudo systemctl')) proceduralScore += 3;
+      if (content.contains('curl ') && (content.contains('| sh') || content.contains('| bash') || content.contains('-fssl') || content.contains('get.docker.com'))) proceduralScore += 3;
+      if (content.contains('docker run hello-world') || content.contains('docker run -d hello-world')) proceduralScore += 3;
       if (content.contains('docker desktop')) proceduralScore += 2;
+      if (content.contains('installation guide') || content.contains('installing docker') || content.contains('download and install') || content.contains('how to install')) proceduralScore += 2;
+      if (RegExp(r'\$\s+[a-z]').allMatches(content).length >= 2) proceduralScore += 2;
       
       if (proceduralScore >= 2) return false;
       return true;
     }).toList();
+
+    final maxPerBook = (nResults * 0.65).ceil().clamp(3, nResults);
 
     while (selected.length < nResults && validCandidates.isNotEmpty) {
       Map<String, dynamic>? best;
@@ -119,7 +135,7 @@ class VectorDbService {
         final sectionKey = '${book}_${chunkIdx ~/ 5}';
 
         if ((sectionCount[sectionKey] ?? 0) >= 2) continue;
-        if ((bookCount[book] ?? 0) >= 3) continue;
+        if ((bookCount[book] ?? 0) >= maxPerBook) continue;
 
         final bm25 = -(candidate['score'] as num).toDouble();
         double maxSim = 0.0;
@@ -131,7 +147,7 @@ class VectorDbService {
           if (sim > maxSim) maxSim = sim;
         }
 
-        const lambda = 0.7;
+        const lambda = 0.6;
         final mmr = lambda * bm25 - (1 - lambda) * maxSim;
 
         if (mmr > bestScore) {
@@ -162,11 +178,26 @@ class VectorDbService {
     String spaceId, 
     String queryText, {
     int nResults = 5,
-    int candidatePool = 40,
+    int candidatePool = 120,
   }) async {
     if (_db == null) throw Exception('DB not initialized');
     
-    final cleanQuery = queryText.replaceAll(RegExp(r'[^\w\s]'), ' ').trim().split(RegExp(r'\s+')).join(' OR ');
+    const stopWords = {
+      'how', 'does', 'do', 'did', 'is', 'are', 'was', 'were', 'what', 'why',
+      'when', 'where', 'which', 'who', 'the', 'a', 'an', 'in', 'on', 'at',
+      'to', 'for', 'of', 'with', 'by', 'and', 'or', 'about', 'can', 'could',
+      'would', 'should', 'work', 'works', 'working', 'explain', 'tell', 'me'
+    };
+    final words = queryText
+        .replaceAll(RegExp(r'[^\w\s]'), ' ')
+        .trim()
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.length > 1)
+        .toList();
+    final contentWords = words.where((w) => !stopWords.contains(w)).toList();
+    final queryTerms = contentWords.isNotEmpty ? contentWords : words;
+    final cleanQuery = queryTerms.join(' OR ');
     
     if (cleanQuery.isEmpty) return [];
 

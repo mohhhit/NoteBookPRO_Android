@@ -7,20 +7,23 @@ import '../models/app_models.dart';
 class LocalLlmService {
   static LlamaEngine? _engine;
   static bool _isInitialized = false;
+  static bool _isLlama = false;
 
   static Future<void> initialize() async {
     if (_isInitialized) return;
 
     final docDir = await getApplicationDocumentsDirectory();
-    final modelPath = '${docDir.path}/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf';
+    final modelPath = '${docDir.path}/Llama-3.2-3B-Instruct-Q4_K_M.gguf';
     final modelFile = File(modelPath);
 
     if (!await modelFile.exists()) {
       throw Exception(
         'Model not found at $modelPath.\n'
-        'Please download Gemma 4 E4B GGUF and place it in the app documents directory.',
+        'Please download Llama-3.2-3B-Instruct-Q4_K_M.gguf and place it in the app documents directory.',
       );
     }
+
+    _isLlama = modelPath.toLowerCase().contains('llama');
 
     final backend = LlamaBackend();
     _engine = LlamaEngine(backend);
@@ -28,7 +31,7 @@ class LocalLlmService {
     await _engine!.loadModel(
       modelPath,
       modelParams: const ModelParams(
-        contextSize: 4096, // Increased to 4096 for RAG
+        contextSize: 4096,
         cacheTypeK: KvCacheType.q8_0,
         cacheTypeV: KvCacheType.q8_0,
       ),
@@ -37,23 +40,50 @@ class LocalLlmService {
     _isInitialized = true;
   }
 
-  static Future<String> generateQueryExpansion(String query) async {
-    if (!_isInitialized || _engine == null) return query;
+  static Future<List<String>> generateSubQueries(String query) async {
+    if (!_isInitialized || _engine == null) return [query];
     
-    final prompt = '<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are an academic search assistant. Your ONLY job is to output 8 technical keywords, synonyms, or related terms for the user\'s query, separated by spaces. Do not write anything else. Do not use markdown.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n$query<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n';
+    final instruction = 
+        'List 3 or 4 core technical sub-topics or mechanisms a textbook covers to explain this question, separated by commas. Do not write anything else.\n\n'
+        'Question: $query';
+
+    final prompt = _isLlama
+        ? '<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n$instruction<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
+        : '<bos><start_of_turn>user\n$instruction<end_of_turn>\n<start_of_turn>model\n';
+    
+    final stopSequences = _isLlama
+        ? ['<|eot_id|>', '<|end_of_text|>']
+        : ['<end_of_turn>', '<eos>'];
     
     String result = "";
     int tokens = 0;
     try {
-      await for (final chunk in _engine!.generate(prompt, params: const GenerationParams(temp: 0.1, maxTokens: 20))) {
+      await for (final chunk in _engine!.generate(
+        prompt, 
+        params: GenerationParams(
+          temp: 0.1, 
+          maxTokens: 50,
+          stopSequences: stopSequences,
+        ),
+      )) {
         result += chunk;
         tokens++;
-        if (tokens > 20) break;
+        if (tokens > 50) break;
       }
     } catch (e) {
-      print('Expansion error: $e');
+      print('Sub-query generation error: $e');
     }
-    return result.trim().replaceAll(RegExp(r'[^\w\s]'), ' ');
+    
+    print('RAG: Raw sub-query output: "$result"');
+    final parts = result
+        .split(RegExp(r'[,;\n]'))
+        .map((s) => s.trim().replaceAll(RegExp(r'^[0-9\.\-\*\s]+'), '').replaceAll(RegExp(r'[^\w\s]'), ' ').trim())
+        .where((s) => s.length > 2)
+        .toList();
+        
+    print('RAG: Decomposed sub-queries: $parts');
+    if (parts.isEmpty) return [query];
+    return [query, ...parts.take(3)];
   }
 
   static Stream<String> generateResponse(List<ChatMessage> history, {List<String>? contextChunks}) async* {
@@ -61,14 +91,19 @@ class LocalLlmService {
       throw Exception('LLM not initialized');
     }
 
-    String systemText = '''You are the expert generation engine for NotebookPRO. Write a faithful, concise answer. Shorter is fine if the excerpts are limited.
+    String systemText = '''You are the expert generation engine for NotebookPRO. Write a faithful, concise, and academically objective answer. Shorter is fine if the excerpts are limited.
 
 STRICT GROUNDING: You MUST ONLY use information present inside the provided context. Do NOT use outside knowledge and do NOT hallucinate.
 
 REQUIRED OUTPUT STRUCTURE:
 - Use clear markdown headings with ### for major sections.
 - Use bulleted breakdowns with bold key terms.
-- Keep explanations dense and structured.
+- If a technical term is named in the context, explain what it does in one short sentence using the context. If the context gives no explanation for that term, state briefly that its mechanism is not detailed in the excerpts.
+- Keep explanations dense, objective, and structured.
+- Do NOT use conversational or textbook tutorial voice (avoid words like "our", "we", "this chapter", "earlier", or "later").
+- Never treat chapter summaries, book previews, or a table of contents as technical explanation.
+- If the excerpts do not contain substantive technical explanation for the question, reply in one or two concise sentences stating what the excerpts do and do not cover, rather than expanding on titles or blurbs.
+- Do NOT output chapter reference pointers or forward-looking statements like "Chapter 5 covers architecture" or "discussed in Chapter 3". Only state technical facts directly explained in the excerpts.
 
 **Citation Rules:**
 - Every factual sentence must be supported by a citation **[1]**.
@@ -79,7 +114,11 @@ CORRECT CITATION FORMAT: "Kubernetes uses a declarative model [1]."
 INCORRECT CITATION FORMAT: "According to Source [1], Kubernetes uses a declarative model."''';
 
     final buffer = StringBuffer();
-    buffer.writeln('<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n$systemText<|eot_id|>');
+    if (_isLlama) {
+      buffer.write('<|begin_of_text|>');
+    } else {
+      buffer.write('<bos>');
+    }
 
     int lastUserIndex = history.lastIndexWhere((msg) => msg.role == 'user');
 
@@ -89,8 +128,11 @@ INCORRECT CITATION FORMAT: "According to Source [1], Kubernetes uses a declarati
       
       String text = msg.content;
       
-      if (i == lastUserIndex && contextChunks != null && contextChunks.isNotEmpty) {
-        text = '''**===== START OF CONTEXT =====**
+      if (i == lastUserIndex) {
+        if (contextChunks != null && contextChunks.isNotEmpty) {
+          text = '''$systemText
+
+**===== START OF CONTEXT =====**
 
 ${contextChunks.join('\n\n')}
 
@@ -98,14 +140,27 @@ ${contextChunks.join('\n\n')}
 
 **Student's Question:** $text
 
-**Instructions:** Answer ONLY using the context between the markers above. If the context does not contain the answer, say you do not have that information. Cite sources in brackets.''';
+**Instructions:** Answer ONLY using the context between the markers above. For each technical term, explain what it does in one short sentence using the context. Cite sources in brackets.''';
+        } else {
+          text = '$systemText\n\n$text';
+        }
       }
 
-      buffer.writeln('<|start_header_id|>${msg.role}<|end_header_id|>\n\n$text<|eot_id|>');
+      if (_isLlama) {
+        final role = (msg.role == 'assistant' || msg.role == 'model') ? 'assistant' : 'user';
+        buffer.write('<|start_header_id|>$role<|end_header_id|>\n\n$text<|eot_id|>');
+      } else {
+        final role = (msg.role == 'assistant' || msg.role == 'model') ? 'model' : 'user';
+        buffer.write('<start_of_turn>$role\n$text<end_of_turn>\n');
+      }
     }
     
-    // Start assistant response
-    buffer.write('<|start_header_id|>assistant<|end_header_id|>\n\n');
+    // Start assistant/model response
+    if (_isLlama) {
+      buffer.write('<|start_header_id|>assistant<|end_header_id|>\n\n');
+    } else {
+      buffer.write('<start_of_turn>model\n');
+    }
     
     final fullPrompt = buffer.toString();
     print('\n================ EXACT LLM PROMPT DUMP FOR EXPERT TEST ================');
@@ -115,13 +170,19 @@ ${contextChunks.join('\n\n')}
     }
     print('=========================================================================\n');
 
-    print('LLM: Starting generation with context size ${history.length} messages (Direct String Gen)');
+    print('LLM: Starting generation with context size ${history.length} messages (${_isLlama ? "Llama 3 Template" : "Gemma Native Template"})');
     final startTime = DateTime.now();
     int tokenCount = 0;
     
     await for (final textChunk in _engine!.generate(
       buffer.toString(),
-      params: const GenerationParams(temp: 0.1),
+      params: GenerationParams(
+        temp: 0.1,
+        maxTokens: 800,
+        stopSequences: _isLlama
+            ? const ['<|eot_id|>', '<|end_of_text|>']
+            : const ['<end_of_turn>', '<eos>'],
+      ),
     )) {
       if (tokenCount == 0) {
         print('LLM: First token generated in ${DateTime.now().difference(startTime).inMilliseconds}ms');
