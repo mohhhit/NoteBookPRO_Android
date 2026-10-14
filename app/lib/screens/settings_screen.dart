@@ -4,8 +4,12 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../providers/app_state.dart';
 import '../services/api_service.dart';
+import '../services/local_llm_service.dart';
+import '../services/online_llm_service.dart';
+import '../services/vector_db_service.dart';
 import '../utils/web_download.dart';
 import '../utils/file_writer.dart';
 
@@ -29,6 +33,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _nvidiaKeyStatus;
   String? _groqKeyStatus;
   String? _testResult;
+  String _selectedOnlineModel = OnlineLlmService.defaultModel;
+  bool _isTestingGeminiKey = false;
+  String? _geminiTestResult;
 
   @override
   void initState() {
@@ -39,10 +46,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _loadApiKeyStatus() async {
     try {
-      final config = await ApiService().getConfig();
+      final prefs = await SharedPreferences.getInstance();
+      final localKey = prefs.getString('gemini_api_key');
+      final localModel = prefs.getString('gemini_model_name');
+
+      Map<String, String?> config = {};
+      try {
+        config = await ApiService().getConfig();
+      } catch (_) {}
+
       if (!mounted) return;
       setState(() {
-        _geminiKeyStatus = config['gemini_api_key'];
+        if (localKey != null && localKey.isNotEmpty) {
+          _geminiKeyStatus = localKey.length > 8
+              ? '${localKey.substring(0, 4)}...${localKey.substring(localKey.length - 4)}'
+              : 'Configured (Local)';
+        } else {
+          _geminiKeyStatus = config['gemini_api_key'];
+        }
+        if (localModel != null && localModel.isNotEmpty) {
+          _selectedOnlineModel = localModel;
+        }
         _nvidiaKeyStatus = config['nvidia_api_key'];
         _groqKeyStatus = config['groq_api_key'];
         _isLoadingKeys = false;
@@ -163,6 +187,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _testGeminiApiKey() async {
+    final keyToTest = _geminiKeyController.text.trim().isNotEmpty
+        ? _geminiKeyController.text.trim()
+        : (context.read<AppState>().geminiApiKey ?? '');
+
+    if (keyToTest.isEmpty) {
+      setState(() {
+        _geminiTestResult = '⚠️ Please enter an API key to test';
+      });
+      return;
+    }
+
+    setState(() {
+      _isTestingGeminiKey = true;
+      _geminiTestResult = null;
+    });
+
+    final res = await OnlineLlmService.testApiKey(keyToTest, model: _selectedOnlineModel);
+
+    if (!mounted) return;
+    setState(() {
+      _isTestingGeminiKey = false;
+      _geminiTestResult = res['success'] == true
+          ? '✅ ${res['message']}'
+          : '❌ ${res['message']}';
+    });
+  }
+
   Future<void> _saveAndReload() async {
     if (_formKey.currentState!.validate()) {
       setState(() => _isSaving = true);
@@ -172,18 +224,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
         final geminiKey = _geminiKeyController.text.trim();
         final nvidiaKey = _nvidiaKeyController.text.trim();
         final groqKey = _groqKeyController.text.trim();
-        if (geminiKey.isNotEmpty ||
-            nvidiaKey.isNotEmpty ||
-            groqKey.isNotEmpty) {
-          await ApiService().updateConfig(
-            geminiKey: geminiKey.isEmpty ? null : geminiKey,
-            nvidiaKey: nvidiaKey.isEmpty ? null : nvidiaKey,
-            groqKey: groqKey.isEmpty ? null : groqKey,
-          );
+
+        // 1. Save Gemini settings locally for on-device online execution
+        final prefs = await SharedPreferences.getInstance();
+        if (geminiKey.isNotEmpty) {
+          await prefs.setString('gemini_api_key', geminiKey);
         }
+        await prefs.setString('gemini_model_name', _selectedOnlineModel);
+
+        // 2. Also try backend config if available
+        try {
+          if (geminiKey.isNotEmpty ||
+              nvidiaKey.isNotEmpty ||
+              groqKey.isNotEmpty) {
+            await ApiService().updateConfig(
+              geminiKey: geminiKey.isEmpty ? null : geminiKey,
+              nvidiaKey: nvidiaKey.isEmpty ? null : nvidiaKey,
+              groqKey: groqKey.isEmpty ? null : groqKey,
+            );
+          }
+        } catch (_) {}
 
         if (mounted) {
           final appState = context.read<AppState>();
+          if (geminiKey.isNotEmpty) {
+            await appState.setGeminiApiKey(geminiKey);
+          }
+          await appState.setOnlineModelName(_selectedOnlineModel);
           await appState.initialize();
 
           Navigator.pop(context);
@@ -354,6 +421,99 @@ class _SettingsScreenState extends State<SettingsScreen> {
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: [
+              // On-Device AI Status Card
+              FutureBuilder<LocalModelInfo>(
+                future: LocalLlmService.getModelInfo(),
+                builder: (context, snapshot) {
+                  final info = snapshot.data;
+                  final isReady = info?.modelExists == true;
+                  return Container(
+                    padding: const EdgeInsets.all(16),
+                    margin: const EdgeInsets.only(bottom: 24),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E1E1E),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: isReady
+                            ? const Color(0xFF38BDF8).withValues(alpha: 0.3)
+                            : Colors.orange.withValues(alpha: 0.3),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.offline_bolt, color: isReady ? const Color(0xFF38BDF8) : Colors.orange, size: 20),
+                            const SizedBox(width: 8),
+                            const Text(
+                              'On-Device AI Engine & Storage',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('Active LLM Model:', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                            Text(
+                              info?.activeModelName ?? 'Checking...',
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('LLM Size on Disk:', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                            Text(
+                              info != null && info.modelExists
+                                  ? '${info.activeModelSizeMb.toStringAsFixed(0)} MB (~${(info.activeModelSizeMb / 1024).toStringAsFixed(2)} GB)'
+                                  : (info?.isDownloading == true ? '${info!.partialDownloadMb.toStringAsFixed(0)} MB (Downloading)' : 'Not downloaded'),
+                              style: TextStyle(
+                                color: isReady ? const Color(0xFF34D399) : Colors.orange,
+                                fontWeight: FontWeight.w500,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('Neural Reranker:', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                            Text(
+                              info?.isRerankerReady == true
+                                  ? 'ms-marco-MiniLM (${info!.rerankerSizeMb.toStringAsFixed(1)} MB)'
+                                  : 'Not loaded',
+                              style: TextStyle(
+                                color: info?.isRerankerReady == true ? const Color(0xFF34D399) : Colors.grey,
+                                fontWeight: FontWeight.w500,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('Inference Backend:', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                            Text(
+                              info?.activeEngine ?? 'LiteRT-LM CPU',
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+
               // Backend Configuration Section
               const Text(
                 'Backend Configuration',
@@ -518,6 +678,72 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 controller: _geminiKeyController,
                 status: _geminiKeyStatus,
                 icon: Icons.auto_awesome,
+              ),
+
+              // Online Gemini Model Dropdown & Test Key Button
+              Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1E1E),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _selectedOnlineModel,
+                    isExpanded: true,
+                    dropdownColor: const Color(0xFF2A2A2A),
+                    items: OnlineLlmService.supportedModels.map((m) {
+                      return DropdownMenuItem<String>(
+                        value: m['id'],
+                        child: Text(
+                          m['name']!,
+                          style: const TextStyle(fontSize: 13, color: Colors.white),
+                        ),
+                      );
+                    }).toList(),
+                    onChanged: (val) {
+                      if (val != null) {
+                        setState(() => _selectedOnlineModel = val);
+                      }
+                    },
+                  ),
+                ),
+              ),
+
+              Padding(
+                padding: const EdgeInsets.only(bottom: 14),
+                child: Row(
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _isTestingGeminiKey ? null : _testGeminiApiKey,
+                      icon: _isTestingGeminiKey
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF8AB4F8)),
+                            )
+                          : const Icon(Icons.check_circle_outline, size: 16),
+                      label: Text(_isTestingGeminiKey ? 'Verifying...' : 'Verify Gemini Key'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFF8AB4F8),
+                        side: const BorderSide(color: Color(0xFF8AB4F8)),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    if (_geminiTestResult != null)
+                      Expanded(
+                        child: Text(
+                          _geminiTestResult!,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _geminiTestResult!.startsWith('✅') ? Colors.green : Colors.red,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
               _buildApiKeyField(
                 label: 'NVIDIA NIM API key (follow-ups)',

@@ -69,6 +69,8 @@ dependencies:
   read_pdf_text: ^0.3.1
   sqlite3_flutter_libs: ^0.6.0+eol
   sqflite_common_ffi: ^2.4.3
+  flutter_onnxruntime: ^1.9.0
+  flutter_litert_lm: ^0.3.0
 
 dev_dependencies:
   flutter_test:

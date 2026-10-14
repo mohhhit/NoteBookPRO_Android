@@ -4,6 +4,7 @@ import '../services/model_downloader.dart';
 import '../services/local_llm_service.dart';
 import '../services/local_database_service.dart';
 import '../services/vector_db_service.dart';
+import '../services/reranker_service.dart';
 import '../main.dart'; // To navigate to HomePage
 
 class SplashScreen extends StatefulWidget {
@@ -54,6 +55,9 @@ class _SplashScreenState extends State<SplashScreen> {
       
       // Initialize Vector DB
       await VectorDbService.initialize();
+
+      // Initialize ONNX Neural Reranker
+      await RerankerService.initialize();
 
       await WakelockPlus.disable();
 

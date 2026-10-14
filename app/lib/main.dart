@@ -15,6 +15,9 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:window_manager/window_manager.dart';
+import 'services/local_llm_service.dart';
+import 'services/online_llm_service.dart';
+import 'services/vector_db_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -814,6 +817,44 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
             ),
           ),
 
+          // AI Engine Status Chip
+          InkWell(
+            onTap: () => _showAiModelDetailsModal(context, appState),
+            borderRadius: BorderRadius.circular(16),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+              decoration: BoxDecoration(
+                color: appState.useOnlineLlm ? const Color(0xFF2E1065) : const Color(0xFF1E293B),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: appState.useOnlineLlm
+                      ? const Color(0xFFA78BFA).withValues(alpha: 0.5)
+                      : const Color(0xFF38BDF8).withValues(alpha: 0.4),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    appState.useOnlineLlm ? Icons.cloud_outlined : Icons.bolt,
+                    size: 14,
+                    color: appState.useOnlineLlm ? const Color(0xFFA78BFA) : const Color(0xFF38BDF8),
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    appState.activeModelDisplayName,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: appState.useOnlineLlm ? const Color(0xFFA78BFA) : const Color(0xFF38BDF8),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+
           // Action Menu
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
@@ -845,6 +886,363 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAiModelDetailsModal(BuildContext context, AppState appState) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E1E1E),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (bottomSheetCtx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return FutureBuilder<List<dynamic>>(
+              future: Future.wait([
+                LocalLlmService.getModelInfo(),
+                appState.currentSpace != null
+                    ? VectorDbService.getChunkCount(appState.currentSpace!.id)
+                    : Future.value(0),
+              ]),
+              builder: (context, snapshot) {
+                final isLoading = !snapshot.hasData;
+                final info = snapshot.hasData ? snapshot.data![0] as LocalModelInfo : null;
+                final chunkCount = snapshot.hasData ? snapshot.data![1] as int : 0;
+                final isOnline = appState.useOnlineLlm;
+
+                return Container(
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 40,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: Colors.white24,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: isOnline
+                                  ? const Color(0xFFA78BFA).withValues(alpha: 0.15)
+                                  : const Color(0xFF38BDF8).withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Icon(
+                              isOnline ? Icons.cloud_outlined : Icons.offline_bolt,
+                              color: isOnline ? const Color(0xFFA78BFA) : const Color(0xFF38BDF8),
+                              size: 22,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  isOnline ? 'Online Cloud Mode (Google AI Studio)' : 'On-Device AI Engine & Storage',
+                                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  isOnline
+                                      ? 'Cloud Synthesis • Same Retrieved Book Chunks'
+                                      : '100% Offline • Zero Remote API Calls',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: isOnline ? const Color(0xFFA78BFA) : const Color(0xFF34D399),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Engine Mode Switcher Bar
+                      Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2A2A2A),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: InkWell(
+                                onTap: () {
+                                  appState.setUseOnlineLlm(false);
+                                  setModalState(() {});
+                                },
+                                borderRadius: BorderRadius.circular(8),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: !isOnline ? const Color(0xFF0284C7) : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(Icons.bolt, size: 16, color: !isOnline ? Colors.white : Colors.grey),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        'Offline (Gemma 4-E2B)',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: !isOnline ? FontWeight.bold : FontWeight.normal,
+                                          color: !isOnline ? Colors.white : Colors.grey,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: InkWell(
+                                onTap: () {
+                                  if (appState.geminiApiKey == null || appState.geminiApiKey!.isEmpty) {
+                                    _promptForGeminiApiKey(context, appState);
+                                  } else {
+                                    appState.setUseOnlineLlm(true);
+                                    setModalState(() {});
+                                  }
+                                },
+                                borderRadius: BorderRadius.circular(8),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: isOnline ? const Color(0xFF7E22CE) : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(Icons.cloud_outlined, size: 16, color: isOnline ? Colors.white : Colors.grey),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        'Online (Gemini API)',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: isOnline ? FontWeight.bold : FontWeight.normal,
+                                          color: isOnline ? Colors.white : Colors.grey,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+
+                      if (isOnline && OnlineLlmService.supportedModels.length > 1) ...[
+                        // Online Model Configuration Card
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF2A2A2A),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xFFA78BFA).withValues(alpha: 0.3)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Text('Selected Gemini Model', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                                  InkWell(
+                                    onTap: () {
+                                      _showOnlineModelPicker(context, appState);
+                                      setModalState(() {});
+                                    },
+                                    child: const Text('Change', style: TextStyle(fontSize: 11, color: Color(0xFFA78BFA), fontWeight: FontWeight.bold)),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                OnlineLlmService.getModelDisplayName(appState.onlineModelName),
+                                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                              ),
+                              const SizedBox(height: 8),
+                              const Divider(height: 1, color: Colors.white12),
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    appState.geminiApiKey != null && appState.geminiApiKey!.isNotEmpty
+                                        ? 'API Key: Configured'
+                                        : 'API Key: Missing',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: appState.geminiApiKey != null && appState.geminiApiKey!.isNotEmpty
+                                          ? const Color(0xFF34D399)
+                                          : const Color(0xFFF87171),
+                                    ),
+                                  ),
+                                  TextButton(
+                                    onPressed: () => _promptForGeminiApiKey(context, appState),
+                                    style: TextButton.styleFrom(
+                                      padding: EdgeInsets.zero,
+                                      minimumSize: const Size(50, 24),
+                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                    ),
+                                    child: Text(
+                                      appState.geminiApiKey != null && appState.geminiApiKey!.isNotEmpty ? 'Update Key' : 'Enter Key',
+                                      style: const TextStyle(fontSize: 12, color: Color(0xFF8AB4F8)),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                      ],
+
+                      if (isLoading)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 24),
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      else ...[
+                        if (!isOnline)
+                          _buildAiInfoCard(
+                            icon: Icons.psychology,
+                            title: 'Generative Model',
+                            value: info?.activeModelName ?? 'Not Found',
+                            subtitle: info?.modelExists == true
+                                ? '${info!.activeEngine} • ${info.activeModelSizeMb.toStringAsFixed(0)} MB on disk'
+                                : (info?.isDownloading == true
+                                    ? 'Downloading... ${info!.partialDownloadMb.toStringAsFixed(0)} MB'
+                                    : 'Model missing from app storage'),
+                            statusColor: info?.modelExists == true ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                            statusText: info?.modelExists == true ? 'Loaded & Ready' : (info?.isDownloading == true ? 'In Progress' : 'Missing'),
+                          ),
+                        if (!isOnline) const SizedBox(height: 10),
+                        _buildAiInfoCard(
+                          icon: Icons.filter_alt,
+                          title: 'Neural Cross-Encoder Reranker',
+                          value: 'ms-marco-MiniLM-L-6-v2',
+                          subtitle: info?.isRerankerReady == true
+                              ? 'ONNX Runtime CPU • ${info!.rerankerSizeMb.toStringAsFixed(1)} MB'
+                              : 'Reranker file not initialized',
+                          statusColor: info?.isRerankerReady == true ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                          statusText: info?.isRerankerReady == true ? 'Active' : 'Fallback',
+                        ),
+                        const SizedBox(height: 10),
+                        _buildAiInfoCard(
+                          icon: Icons.menu_book,
+                          title: 'Space Knowledge Base',
+                          value: appState.currentSpace?.name ?? 'No Space Selected',
+                          subtitle: '$chunkCount chunks indexed (SQLite FTS5 Inverted Index)',
+                          statusColor: chunkCount > 0 ? const Color(0xFF34D399) : const Color(0xFF9CA3AF),
+                          statusText: chunkCount > 0 ? '$chunkCount chunks' : '0 chunks',
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF141E28),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: const Color(0xFF38BDF8).withValues(alpha: 0.2)),
+                          ),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Icon(Icons.info_outline, size: 16, color: Color(0xFF38BDF8)),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  isOnline
+                                      ? 'Comparison diagnostic mode: Online queries pass the exact same SQLite FTS5 retrieved chunks and system prompt to Google AI Studio Gemini so you can isolate whether model capacity or retrieval coverage affects the answer.'
+                                      : 'Fast ingestion is normal: textbooks are indexed in ~1s using SQLite FTS5 in C. Neural cross-encoder reranking runs dynamically during query execution on the top candidates.',
+                                  style: TextStyle(fontSize: 11, color: Colors.grey.shade400, height: 1.35),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildAiInfoCard({
+    required IconData icon,
+    required String title,
+    required String value,
+    required String subtitle,
+    required Color statusColor,
+    required String statusText,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A2A2A),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: Colors.white70, size: 22),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(title, style: const TextStyle(fontSize: 11, color: Colors.grey, fontWeight: FontWeight.w500)),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: statusColor.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        statusText,
+                        style: TextStyle(fontSize: 10, color: statusColor, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(value, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.white)),
+                const SizedBox(height: 2),
+                Text(subtitle, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              ],
+            ),
           ),
         ],
       ),
@@ -1829,79 +2227,342 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
         alignment: Alignment.center,
         child: ConstrainedBox(
           constraints: BoxConstraints(maxWidth: maxInputWidth),
-          child: Row(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Input field
-              Expanded(
-                child: Container(
-                  constraints: const BoxConstraints(maxWidth: 720),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E1E1E),
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(color: const Color(0xFF3C4043)),
-                  ),
-                  child: Shortcuts(
-                    shortcuts: const <ShortcutActivator, Intent>{
-                      SingleActivator(LogicalKeyboardKey.enter):
-                          _SendMessageIntent(),
-                      SingleActivator(LogicalKeyboardKey.numpadEnter):
-                          _SendMessageIntent(),
-                    },
-                    child: Actions(
-                      actions: <Type, Action<Intent>>{
-                        _SendMessageIntent: CallbackAction<_SendMessageIntent>(
-                          onInvoke: (_) {
-                            _sendCurrentMessage(appState);
-                            return null;
+              // Online / Offline Model Toggle Pill
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 6),
+                child: _buildModelSelectorRow(context, appState),
+              ),
+              Row(
+                children: [
+                  // Input field
+                  Expanded(
+                    child: Container(
+                      constraints: const BoxConstraints(maxWidth: 720),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E1E1E),
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(color: const Color(0xFF3C4043)),
+                      ),
+                      child: Shortcuts(
+                        shortcuts: const <ShortcutActivator, Intent>{
+                          SingleActivator(LogicalKeyboardKey.enter):
+                              _SendMessageIntent(),
+                          SingleActivator(LogicalKeyboardKey.numpadEnter):
+                              _SendMessageIntent(),
+                        },
+                        child: Actions(
+                          actions: <Type, Action<Intent>>{
+                            _SendMessageIntent: CallbackAction<_SendMessageIntent>(
+                              onInvoke: (_) {
+                                _sendCurrentMessage(appState);
+                                return null;
+                              },
+                            ),
                           },
-                        ),
-                      },
-                      child: TextField(
-                        controller: _messageController,
-                        focusNode: _messageFocusNode,
-                        minLines: 1,
-                        maxLines: 5,
-                        keyboardType: TextInputType.multiline,
-                        textInputAction: TextInputAction.newline,
-                        decoration: const InputDecoration(
-                          hintText: 'Ask anything...',
-                          border: InputBorder.none,
-                          contentPadding: EdgeInsets.symmetric(
-                            horizontal: 20,
-                            vertical: 14,
+                          child: TextField(
+                            controller: _messageController,
+                            focusNode: _messageFocusNode,
+                            minLines: 1,
+                            maxLines: 5,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            decoration: const InputDecoration(
+                              hintText: 'Ask anything...',
+                              border: InputBorder.none,
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 14,
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
-                ),
-              ),
 
-              const SizedBox(width: 12),
+                  const SizedBox(width: 12),
 
-              // Send button
-              Container(
-                decoration: BoxDecoration(
-                  color: appState.isThinking
-                      ? const Color(0xFF2D2D2D)
-                      : const Color(0xFF8AB4F8),
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: IconButton(
-                  icon: const Icon(Icons.send_rounded, size: 20),
-                  color: appState.isThinking
-                      ? const Color(0xFF9AA0A6)
-                      : Colors.black,
-                  tooltip: 'Send',
-                  onPressed: appState.isThinking
-                      ? null
-                      : () => _sendCurrentMessage(appState),
-                ),
+                  // Send button
+                  Container(
+                    decoration: BoxDecoration(
+                      color: appState.isThinking
+                          ? const Color(0xFF2D2D2D)
+                          : const Color(0xFF8AB4F8),
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.send_rounded, size: 20),
+                      color: appState.isThinking
+                          ? const Color(0xFF9AA0A6)
+                          : Colors.black,
+                      tooltip: 'Send',
+                      onPressed: appState.isThinking
+                          ? null
+                          : () => _sendCurrentMessage(appState),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildModelSelectorRow(BuildContext context, AppState appState) {
+    final isOnline = appState.useOnlineLlm;
+    final modelName = appState.activeModelDisplayName;
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(2),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E1E1E),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFF334155)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Offline Pill
+              InkWell(
+                onTap: () => appState.setUseOnlineLlm(false),
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: !isOnline ? const Color(0xFF0369A1).withValues(alpha: 0.35) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(14),
+                    border: !isOnline ? Border.all(color: const Color(0xFF38BDF8), width: 1) : null,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.bolt, size: 13, color: !isOnline ? const Color(0xFF38BDF8) : Colors.grey),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Offline (Gemma)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: !isOnline ? FontWeight.w600 : FontWeight.normal,
+                          color: !isOnline ? const Color(0xFF38BDF8) : Colors.grey,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(width: 2),
+
+              // Online Pill
+              InkWell(
+                onTap: () async {
+                  if (appState.geminiApiKey == null || appState.geminiApiKey!.isEmpty) {
+                    _promptForGeminiApiKey(context, appState);
+                  } else {
+                    appState.setUseOnlineLlm(true);
+                  }
+                },
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isOnline ? const Color(0xFF581C87).withValues(alpha: 0.45) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(14),
+                    border: isOnline ? Border.all(color: const Color(0xFFA78BFA), width: 1) : null,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.cloud_outlined, size: 13, color: isOnline ? const Color(0xFFA78BFA) : Colors.grey),
+                      const SizedBox(width: 4),
+                      Text(
+                        isOnline ? 'Online ($modelName)' : 'Online (gemini3.5-flash-lite)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: isOnline ? FontWeight.w600 : FontWeight.normal,
+                          color: isOnline ? const Color(0xFFA78BFA) : Colors.grey,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        if (isOnline && OnlineLlmService.supportedModels.length > 1) ...[
+          const SizedBox(width: 6),
+          // Model selection button
+          InkWell(
+            onTap: () => _showOnlineModelPicker(context, appState),
+            borderRadius: BorderRadius.circular(14),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E1E),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFFA78BFA).withValues(alpha: 0.3)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.tune, size: 12, color: Color(0xFFA78BFA)),
+                  SizedBox(width: 3),
+                  Text('Model', style: TextStyle(fontSize: 10, color: Color(0xFFA78BFA))),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  void _promptForGeminiApiKey(BuildContext context, AppState appState) {
+    final controller = TextEditingController(text: appState.geminiApiKey ?? '');
+    showDialog(
+      context: context,
+      builder: (dialogCtx) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(
+            children: [
+              Icon(Icons.key, color: Color(0xFFA78BFA), size: 20),
+              SizedBox(width: 8),
+              Text('Google AI Studio API Key', style: TextStyle(fontSize: 16)),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Enter your Gemini API key from Google AI Studio to run inference online against your locally retrieved textbook chunks:',
+                style: TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                obscureText: true,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: InputDecoration(
+                  hintText: 'AIzaSy...',
+                  hintStyle: const TextStyle(color: Colors.white30),
+                  filled: true,
+                  fillColor: const Color(0xFF2A2A2A),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final key = controller.text.trim();
+                if (key.isNotEmpty) {
+                  await appState.setGeminiApiKey(key);
+                  await appState.setUseOnlineLlm(true);
+                  if (dialogCtx.mounted) Navigator.pop(dialogCtx);
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFA78BFA),
+                foregroundColor: Colors.black,
+              ),
+              child: const Text('Save & Use Online'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showOnlineModelPicker(BuildContext context, AppState appState) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E1E1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (bottomSheetCtx) {
+        return Container(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Select Online Gemini Model',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Cloud inference uses the exact same SQLite FTS5 retrieved chunks & system prompt.',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 16),
+              ...OnlineLlmService.supportedModels.map((m) {
+                final isSelected = appState.onlineModelName == m['id'];
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  decoration: BoxDecoration(
+                    color: isSelected ? const Color(0xFF581C87).withValues(alpha: 0.35) : const Color(0xFF2A2A2A),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: isSelected ? const Color(0xFFA78BFA) : Colors.transparent,
+                    ),
+                  ),
+                  child: ListTile(
+                    dense: true,
+                    title: Text(
+                      m['name']!,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                        color: isSelected ? const Color(0xFFA78BFA) : Colors.white,
+                      ),
+                    ),
+                    trailing: isSelected
+                        ? const Icon(Icons.check_circle, color: Color(0xFFA78BFA), size: 18)
+                        : null,
+                    onTap: () async {
+                      await appState.setOnlineModelName(m['id']!);
+                      if (bottomSheetCtx.mounted) Navigator.pop(bottomSheetCtx);
+                    },
+                  ),
+                );
+              }),
+            ],
+          ),
+        );
+      },
     );
   }
 

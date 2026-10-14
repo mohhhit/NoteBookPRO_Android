@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'package:read_pdf_text/read_pdf_text.dart';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
@@ -154,86 +153,70 @@ class DocumentProcessor {
     bool semantic = true,
     String? sourceFilename,
   }) {
-    final rawChunks = _recursiveSplit(text, chunkSize, overlap);
-    return rawChunks.map((chunk) => chunk.trim()).toList();
-  }
+    if (text.trim().isEmpty) return [];
 
-  List<String> _recursiveSplit(String text, int chunkSize, int overlap) {
-    final separators = ["\n\n", "\n", ".", "?", "!", " ", ""];
-    
-    List<String> splitText(String txt, int sepIndex) {
-      if (txt.length <= chunkSize) return [txt];
-      if (sepIndex >= separators.length) return _simpleChunk(txt, chunkSize, overlap);
-      
-      final separator = separators[sepIndex];
-      final parts = txt.split(separator);
-      
-      if (parts.length == 1) {
-        return splitText(txt, sepIndex + 1);
-      }
-      
-      final chunks = <String>[];
-      var currentChunk = '';
-      
-      for (final part in parts) {
-        final nextChunk = currentChunk.isEmpty ? part : currentChunk + separator + part;
-        if (nextChunk.length <= chunkSize) {
-          currentChunk = nextChunk;
-        } else {
-          if (currentChunk.isNotEmpty) {
-            chunks.add(currentChunk);
-            // Overlap logic is hard in strict recursion, so we just fall back 
-            // to a simpler approach or accept slight truncation in boundaries.
-            // For a true Langchain replica, we merge chunks while accounting for overlap.
-          }
-          currentChunk = part;
-        }
-      }
-      
-      if (currentChunk.isNotEmpty) {
-        chunks.add(currentChunk);
-      }
-      
-      // If any resulting chunk is still too big, split it further
-      final finalChunks = <String>[];
-      for (final c in chunks) {
-        if (c.length > chunkSize) {
-          finalChunks.addAll(splitText(c, sepIndex + 1));
-        } else {
-          finalChunks.add(c);
-        }
-      }
-      
-      return finalChunks;
-    }
-    
-    return splitText(text, 0);
-  }
-
-  List<String> _simpleChunk(String text, int chunkSize, int overlap) {
+    // Split text cleanly by paragraph and sentence boundaries
+    final paragraphs = text.split(RegExp(r'\n\s*\n'));
     final chunks = <String>[];
-    int start = 0;
-    
-    while (start < text.length) {
-      int end = start + chunkSize;
-      String chunk = text.substring(start, end > text.length ? text.length : end);
-      
-      if (end < text.length) {
-        final lastPeriod = chunk.lastIndexOf('.');
-        final lastNewline = chunk.lastIndexOf('\n');
-        final breakPoint = lastPeriod > lastNewline ? lastPeriod : lastNewline;
-        
-        if (breakPoint > chunkSize * 0.5) {
-          chunk = chunk.substring(0, breakPoint + 1);
-          end = start + breakPoint + 1;
+    var currentChunk = StringBuffer();
+    var overlapBuffer = <String>[];
+
+    void emitChunk() {
+      final chunkStr = currentChunk.toString().trim();
+      if (chunkStr.isNotEmpty) {
+        chunks.add(chunkStr);
+      }
+      currentChunk.clear();
+      if (overlapBuffer.isNotEmpty) {
+        currentChunk.write(overlapBuffer.join(' '));
+        currentChunk.write(' ');
+      }
+    }
+
+    for (final para in paragraphs) {
+      final trimmedPara = para.trim();
+      if (trimmedPara.isEmpty) continue;
+
+      // If entire paragraph fits in the current chunk
+      if (currentChunk.length + trimmedPara.length + 1 <= chunkSize) {
+        if (currentChunk.isNotEmpty) currentChunk.write('\n\n');
+        currentChunk.write(trimmedPara);
+
+        // Keep last 1-2 sentences for overlap
+        final sList = trimmedPara.split(RegExp(r'(?<=[.!?])\s+'));
+        if (sList.isNotEmpty) {
+          overlapBuffer = sList.length > 2 ? sList.sublist(sList.length - 2) : sList;
+        }
+      } else {
+        // Break paragraph cleanly by sentence
+        final sentences = trimmedPara.split(RegExp(r'(?<=[.!?])\s+'));
+        for (final sentence in sentences) {
+          final sTrimmed = sentence.trim();
+          if (sTrimmed.isEmpty) continue;
+
+          if (currentChunk.length + sTrimmed.length + 1 > chunkSize && currentChunk.isNotEmpty) {
+            emitChunk();
+          }
+
+          if (currentChunk.isNotEmpty) currentChunk.write(' ');
+          currentChunk.write(sTrimmed);
+
+          // Maintain trailing sentences for next chunk's overlap
+          overlapBuffer.add(sTrimmed);
+          if (overlapBuffer.length > 2) {
+            overlapBuffer.removeAt(0);
+          }
         }
       }
-      
-      chunks.add(chunk.trim());
-      start = end - overlap;
-      if (start < 0) start = 0; // sanity
     }
-    
-    return chunks;
+
+    if (currentChunk.isNotEmpty) {
+      final lastStr = currentChunk.toString().trim();
+      if (lastStr.isNotEmpty) {
+        chunks.add(lastStr);
+      }
+    }
+
+    return chunks.where((c) => c.length > 40).toList();
   }
 }
