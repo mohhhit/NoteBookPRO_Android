@@ -9,6 +9,7 @@ import 'services/api_service.dart';
 import 'screens/settings_screen.dart';
 import 'screens/studio_screen.dart';
 import 'screens/splash_screen.dart';
+import 'services/studio_service.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
@@ -864,6 +865,9 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
             ),
             onSelected: (value) {
               switch (value) {
+                case 'export_chat_pdf':
+                  appState.downloadCurrentChatAnswersAsPdf();
+                  break;
                 case 'settings':
                   Navigator.push(
                     context,
@@ -875,6 +879,16 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
               }
             },
             itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'export_chat_pdf',
+                child: Row(
+                  children: [
+                    Icon(Icons.picture_as_pdf_outlined, size: 20),
+                    SizedBox(width: 12),
+                    Text('Download Chat as PDF'),
+                  ],
+                ),
+              ),
               const PopupMenuItem(
                 value: 'settings',
                 child: Row(
@@ -1710,12 +1724,20 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                           index,
                         );
 
+                        final cleanAnswer =
+                            StudioService.formatChatAnswer(message.content);
+
                         if (value == 'add_to_notebook') {
                           await appState.addAssistantReplyToNotebook(
                             question: question,
-                            answer: message.content,
+                            answer: cleanAnswer,
                             assistantTimestamp: message.timestamp,
                             tags: const ['chat', 'saved_from_reply'],
+                          );
+                        } else if (value == 'download_pdf') {
+                          await appState.downloadAssistantReplyAsPdf(
+                            question: question,
+                            answer: cleanAnswer,
                           );
                         }
                       },
@@ -1731,6 +1753,20 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                               ),
                               SizedBox(width: 8),
                               Text('Add to notebook'),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'download_pdf',
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.picture_as_pdf_outlined,
+                                size: 18,
+                                color: Colors.white,
+                              ),
+                              SizedBox(width: 8),
+                              Text('Download as PDF'),
                             ],
                           ),
                         ),
@@ -1859,8 +1895,9 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                             appState.currentChat!.messages,
                             index,
                           );
-                          final payload =
-                              'Q: $question\n\nA: ${message.content}';
+                          final cleanAnswer =
+                              StudioService.formatChatAnswer(message.content);
+                          final payload = 'Q: $question\n\nA: $cleanAnswer';
                           await Clipboard.setData(ClipboardData(text: payload));
                           if (!mounted) return;
                           ScaffoldMessenger.of(context).showSnackBar(

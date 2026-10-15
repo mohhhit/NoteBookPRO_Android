@@ -13,6 +13,8 @@ import '../services/vector_db_service.dart';
 import '../services/reranker_service.dart';
 import '../services/prompt_builder.dart';
 import '../utils/answer_sanitizer.dart';
+import '../services/studio_service.dart';
+import '../services/pdf_export_service.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter/foundation.dart';
 
@@ -715,22 +717,110 @@ class AppState extends ChangeNotifier with WindowListener {
     }
   }
 
-  // --- Notebook/Studio Stubs ---
+  // --- Notebook/Studio Methods ---
   Future<void> addAssistantReplyToNotebook({
     required String question, 
     required String answer,
     String? assistantTimestamp,
     List<String>? tags,
   }) async {
-    _showTemporarySuccess("Studio Notebook is offline in Android Prototype");
+    if (_currentSpace == null) {
+      _setError('Please select a space first.');
+      return;
+    }
+    try {
+      await StudioService.addChatToNotebook(
+        spaceId: _currentSpace!.id,
+        question: question,
+        answer: answer,
+        chatId: _currentChat?.id,
+        assistantTimestamp: assistantTimestamp,
+        tags: tags ?? const ['chat', 'saved_from_reply'],
+        spaceName: _currentSpace!.name,
+      );
+      _showTemporarySuccess('Saved to Notebook');
+    } catch (e) {
+      _setError('Failed to save to notebook: $e');
+    }
   }
 
-  Future<void> downloadAssistantReplyAsPdf({required String question, required String answer}) async {
-    _showTemporarySuccess("PDF Export is offline in Android Prototype");
+  Future<void> downloadAssistantReplyAsPdf({
+    required String question, 
+    required String answer,
+  }) async {
+    try {
+      final spaceName = _currentSpace?.name ?? 'General Space';
+      final result = await StudioService.exportSingleAnswerPdf(
+        spaceId: spaceName,
+        question: question,
+        answer: answer,
+      );
+      final saved = await PdfExportService.savePdfFile(
+        fileName: result.filename,
+        bytes: result.bytes,
+        dialogTitle: 'Save Answer PDF',
+      );
+      if (saved) {
+        _showTemporarySuccess('PDF saved: ${result.filename}');
+      }
+    } catch (e) {
+      _setError('Failed to export PDF: $e');
+    }
   }
 
   Future<void> downloadCurrentChatAnswersAsPdf() async {
-    _showTemporarySuccess("PDF Export is offline in Android Prototype");
+    if (_currentChat == null || _currentChat!.messages.isEmpty) {
+      _setError('No messages in this chat to export.');
+      return;
+    }
+    try {
+      final spaceName = _currentSpace?.name ?? 'General Space';
+      final messages = _currentChat!.messages;
+      final qaItems = <Map<String, String>>[];
+
+      for (int i = 0; i < messages.length; i++) {
+        if (messages[i].role == 'assistant' && messages[i].content.trim().isNotEmpty) {
+          String q = 'Question';
+          for (int j = i - 1; j >= 0; j--) {
+            if (messages[j].role == 'user') {
+              q = messages[j].content;
+              break;
+            }
+          }
+          qaItems.add({
+            'question': q,
+            'answer': StudioService.formatChatAnswer(messages[i].content),
+          });
+        }
+      }
+
+      if (qaItems.isEmpty) {
+        _setError('No assistant replies to export in this chat.');
+        return;
+      }
+
+      final chatInfo = _chats.where((c) => c.id == _currentChat?.id).firstOrNull;
+      final chatTitle = (chatInfo != null && chatInfo.title.isNotEmpty)
+          ? chatInfo.title
+          : 'Chat Export';
+
+      final result = await StudioService.exportCombinedAnswersPdf(
+        spaceId: spaceName,
+        chatTitle: chatTitle,
+        items: qaItems,
+      );
+
+      final saved = await PdfExportService.savePdfFile(
+        fileName: result.filename,
+        bytes: result.bytes,
+        dialogTitle: 'Save Chat PDF',
+      );
+      if (saved) {
+        _showTemporarySuccess('Chat PDF saved: ${result.filename}');
+      }
+    } catch (e) {
+      _setError('Failed to export chat PDF: $e');
+    }
   }
 
   // --- Files ---
