@@ -11,6 +11,7 @@ import '../services/online_llm_service.dart';
 import '../services/document_processor.dart';
 import '../services/vector_db_service.dart';
 import '../services/reranker_service.dart';
+import '../services/prompt_builder.dart';
 import '../utils/answer_sanitizer.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -352,15 +353,29 @@ class AppState extends ChangeNotifier with WindowListener {
         if (comparisonEntities != null) {
           final eA = comparisonEntities['entityA']!;
           final eB = comparisonEntities['entityB']!;
-          print('[RAG COMPARISON] Detected comparison between "$eA" and "$eB"');
-          final facets = buildFacetsForComparison(eA, eB);
+          final scope = extractScopePhrase(query);
+          print('[RAG COMPARISON] Detected comparison between "$eA" and "$eB"${scope != null ? " (scope: $scope)" : ""}');
+          final facets = buildFacetsForComparison(eA, eB, scope: scope);
           final facetRequests = <Map<String, dynamic>>[];
+
+          // 1. Always run full question as direct broad BM25 and reranker query to capture verbatim textbook matches
+          final directCandidates = await VectorDbService.getBm25Candidates(
+            _currentSpace!.id,
+            query,
+            candidatePool: 50,
+          );
+          facetRequests.add({
+            'label': 'Direct Question Evidence',
+            'bm25Query': query,
+            'rerankQuery': query,
+            'candidates': directCandidates,
+          });
 
           for (final f in facets) {
             final candidates = await VectorDbService.getBm25Candidates(
               _currentSpace!.id,
               f['bm25Query']!,
-              candidatePool: 25,
+              candidatePool: 50,
               entityAnchor: f['anchor'],
             );
             facetRequests.add({
@@ -373,18 +388,57 @@ class AppState extends ChangeNotifier with WindowListener {
 
           rerankResult = await RerankerService.rerankFacets(
             facetRequests,
-            targetCount: 6,
-            cutoffThreshold: -0.5,
+            targetCount: 8,
+            cutoffThreshold: -4.0,
           );
         } else if (isConceptual) {
           final facets = buildFacetsForTopic(query);
           final facetRequests = <Map<String, dynamic>>[];
 
+          // 1. Always run full question as direct broad BM25 and reranker query to capture verbatim textbook matches
+          final directCandidates = await VectorDbService.getBm25Candidates(
+            _currentSpace!.id,
+            query,
+            candidatePool: 50,
+          );
+          facetRequests.add({
+            'label': 'Direct Question Evidence',
+            'bm25Query': query,
+            'rerankQuery': query,
+            'candidates': directCandidates,
+          });
+
+          // 2. Era facets if query involves temporal, legacy, or modern architecture
+          final isEraQuery = RegExp(
+            r'\b(?:traditional|legacy|modern|cloud|evolution|history|historical|older|newer|recent|earlier)\b',
+            caseSensitive: false,
+          ).hasMatch(query);
+          if (isEraQuery) {
+            final eraList = PromptBuilder.eraFacets(coreEntity);
+            for (int i = 0; i < eraList.length; i++) {
+              final eraQuery = eraList[i];
+              final eraLabel = i == 0 ? 'Traditional & Legacy Architecture' : 'Modern & Cloud Architecture';
+              final eraCandidates = await VectorDbService.getBm25Candidates(
+                _currentSpace!.id,
+                eraQuery,
+                candidatePool: 50,
+                entityAnchor: coreEntity,
+              );
+              facetRequests.add({
+                'label': eraLabel,
+                'bm25Query': eraQuery,
+                'rerankQuery': eraQuery,
+                'candidates': eraCandidates,
+                'anchor': coreEntity,
+              });
+            }
+          }
+
           for (final f in facets) {
             final candidates = await VectorDbService.getBm25Candidates(
               _currentSpace!.id,
               f['bm25Query']!,
-              candidatePool: 25,
+              candidatePool: 50,
               entityAnchor: f['anchor'] ?? coreEntity,
             );
             facetRequests.add({
@@ -397,27 +451,30 @@ class AppState extends ChangeNotifier with WindowListener {
 
           rerankResult = await RerankerService.rerankFacets(
             facetRequests,
-            targetCount: 6,
-            cutoffThreshold: -0.5,
+            targetCount: 8,
+            cutoffThreshold: -4.0,
           );
         } else {
           final candidates = await VectorDbService.getBm25Candidates(
             _currentSpace!.id,
             query,
-            candidatePool: 35,
-            entityAnchor: coreEntity,
+            candidatePool: 50,
           );
           rerankResult = await RerankerService.rerank(
             query,
             candidates,
-            targetCount: 4,
-            cutoffThreshold: -0.5,
+            targetCount: 6,
+            cutoffThreshold: -4.0,
           );
         }
 
         allResults = rerankResult.rankedCandidates;
         missingFacets = rerankResult.missingFacets;
         unusedCandidates = rerankResult.unusedCandidates;
+
+        if (rerankResult.isPartialMatch) {
+          print('[RAG SOFT GATE] Query "$query" is a partial match (topScore: ${rerankResult.topScore.toStringAsFixed(2)}). Informing LLM of partial evidence.');
+        }
 
         if (!rerankResult.isCovered || allResults.isEmpty) {
           final closest = rerankResult.closestSource != null
@@ -455,8 +512,8 @@ class AppState extends ChangeNotifier with WindowListener {
           // Raw content for context (PromptBuilder will compress this)
           contextChunks.add('[$sourceIndex] $label ($facetLabel):\n$content');
 
-          // Shorten passage text to ~350 characters for mobile display while centering on the core entity
-          String formatSnippet(String text, String entity, {int maxLen = 350}) {
+          // Shorten passage text to ~700 characters for mobile display while centering on the core entity
+          String formatSnippet(String text, String entity, {int maxLen = 700}) {
             final clean = text.replaceAll(RegExp(r'\s+'), ' ').trim();
             if (clean.length <= maxLen) return clean;
 
@@ -465,9 +522,9 @@ class AppState extends ChangeNotifier with WindowListener {
             final entityIdx = cleanLower.indexOf(entityLower);
 
             // If the entity is mentioned further into the passage, center snippet on it
-            if (entityIdx > 120 && entityIdx < clean.length - 30) {
-              final start = clean.lastIndexOf(' ', math.max(0, entityIdx - 40));
-              final safeStart = start != -1 ? start + 1 : math.max(0, entityIdx - 40);
+            if (entityIdx > 250 && entityIdx < clean.length - 50) {
+              final start = clean.lastIndexOf(' ', math.max(0, entityIdx - 80));
+              final safeStart = start != -1 ? start + 1 : math.max(0, entityIdx - 80);
               final end = clean.indexOf(' ', math.min(clean.length - 1, safeStart + maxLen));
               final safeEnd = end != -1 ? end : math.min(clean.length, safeStart + maxLen);
               return '...${clean.substring(safeStart, safeEnd).trim()}...';
@@ -475,7 +532,7 @@ class AppState extends ChangeNotifier with WindowListener {
 
             final truncated = clean.substring(0, maxLen);
             final lastSpace = truncated.lastIndexOf(' ');
-            return '${(lastSpace > 240 ? truncated.substring(0, lastSpace) : truncated).trim()}...';
+            return '${(lastSpace > 500 ? truncated.substring(0, lastSpace) : truncated).trim()}...';
           }
 
           relevantPassages.add({
@@ -487,6 +544,10 @@ class AppState extends ChangeNotifier with WindowListener {
           });
 
           sourceIndex++;
+        }
+
+        if (rerankResult.isPartialMatch) {
+          contextChunks.add('NOTE ON PARTIAL COVERAGE: The retrieved textbook excerpts provide partial coverage for this specific question. Answer the part covered by the excerpts and state clearly what is not specified, rather than refusing.');
         }
 
         if (missingFacets.isNotEmpty) {
@@ -556,6 +617,7 @@ class AppState extends ChangeNotifier with WindowListener {
       }
 
       // 6. Post-process response:
+      // 6. Post-process response:
       // a) Sanitize LaTeX delimiters, repair markdown tables, and remove artifact lines (non-destructive)
       final sanitizedResponse = AnswerSanitizer.finalize(
         fullResponse,
@@ -563,14 +625,22 @@ class AppState extends ChangeNotifier with WindowListener {
         trimTruncated: false,
       );
 
+      final uc = PromptBuilder.inferUseCase(query);
+      final scope = extractScopePhrase(query);
+
       // b) Compute deterministic citation assignments from raw chunks and drop near-duplicates
       final rawChunksList = allResults.map((r) => r['content'] as String).toList();
       String cleanedResponse = enforceCitationsAndCleanOutput(
         sanitizedResponse,
         rawChunks: rawChunksList,
+        useCase: uc,
       );
 
-      // Audit Trace: Dump exact trace requested by expert to debug retrieval, generation, and verification
+      // Audit Trace: Dump exact 4-part trace requested by expert to debug retrieval, generation, and verification
+      final preparedChunks = PromptBuilder.prepareChunks(contextChunks, query);
+      final auditSystemPrompt = PromptBuilder.buildSystemPrompt(uc, chunks: preparedChunks, scope: scope);
+      final auditUserMessage = PromptBuilder.buildUserMessage(query, preparedChunks, uc, scope: scope);
+
       print('\n================== [RAG_AUDIT_TRACE: $query] ==================');
       print('--- 1. RETRIEVED RAW CHUNKS (${allResults.length} chunks) ---');
       for (int i = 0; i < allResults.length; i++) {
@@ -581,30 +651,35 @@ class AppState extends ChangeNotifier with WindowListener {
         print('[RAW CHUNK ${i + 1}] $book (score=$score):\n${r['content']}\n');
       }
 
-      print('--- 2. CONTEXT STRING SENT TO LOCAL LLM (${contextChunks.length} items) ---');
-      for (int i = 0; i < contextChunks.length; i++) {
-        print(contextChunks[i]);
-      }
+      print('--- 2. EXACT PROMPT & CONTEXT SENT TO LLM ---');
+      print('[SYSTEM INSTRUCTION]\n$auditSystemPrompt\n');
+      print('[USER MESSAGE WITH CONTEXT]\n$auditUserMessage\n');
 
-      print('\n--- 3. UNFILTERED MODEL RESPONSE ---');
+      print('--- 3. UNFILTERED RAW MODEL RESPONSE ---');
       print(fullResponse);
 
       print('\n--- 4. POST-PROCESSED & VERIFIED RESPONSE ---');
       print(cleanedResponse);
       print('================== [END RAG_AUDIT_TRACE] ==================\n');
 
-      // 7. Append "Relevant Passages" and missing facets report for student benefit
-      if (relevantPassages.isNotEmpty) {
+      // 7. Append "Relevant Passages" with best-matching supporting sentences
+      final bestPassages = buildBestMatchingPassages(
+        allResults: allResults,
+        responseText: cleanedResponse,
+        query: query,
+      );
+
+      if (bestPassages.isNotEmpty) {
+        relevantPassages.clear();
+        relevantPassages.addAll(bestPassages);
         final passageBuffer = StringBuffer();
         passageBuffer.writeln('\n\n---\n### Relevant Passages');
-        for (final p in relevantPassages) {
+        for (final p in bestPassages) {
           final yr = p['year'] != 'N/A' ? ' (${p['year']})' : '';
           passageBuffer.writeln('**[${p['index']}] ${p['book']}**$yr — *${p['facet']}*:');
           passageBuffer.writeln('> "${p['text']}"\n');
         }
         // Only surface the coverage note when the answer is sparse (< 80 words).
-        // A rich answer already incorporates what the books contain; the model's
-        // grounding instruction ("leave that part out") handles genuine gaps.
         final answerWordCount = cleanedResponse
             .replaceAll(RegExp(r'\s+'), ' ')
             .trim()
@@ -703,9 +778,19 @@ class AppState extends ChangeNotifier with WindowListener {
         // Let UI update
         await Future.delayed(const Duration(milliseconds: 10));
 
-        // 1. Extract text via Native Platform Channel (ReadPdfText) -> Avoids Dart Heap OOM
+        // 1. Extract text via Native Platform Channel (ReadPdfText) -> Syncfusion -> On-Device ML Kit OCR
         final processor = DocumentProcessor();
-        final fileData = await processor.processFile(file.path!);
+        final fileData = await processor.processFile(
+          file.path!,
+          onProgress: (current, total) {
+            _uploadStatus = 'OCR scanning page $current of $total (${file.name})...';
+            notifyListeners();
+          },
+          onStatus: (status) {
+            _uploadStatus = '$status (${file.name})';
+            notifyListeners();
+          },
+        );
         final content = fileData['content'] as String;
         final virtualFilename = fileData['virtual_filename'] as String;
         fileData.remove('content'); // free immediately
@@ -715,6 +800,13 @@ class AppState extends ChangeNotifier with WindowListener {
           'content': content,
           'virtualFilename': virtualFilename,
         });
+
+        if (chunks.isEmpty) {
+          throw Exception(
+            'No readable text could be extracted from "${fileData['filename']}". '
+            'The file may be blank, corrupted, or password-protected.',
+          );
+        }
         
         // Formulate metadata
         final metadatas = chunks.asMap().entries.map((entry) => {
@@ -832,39 +924,58 @@ class AppState extends ChangeNotifier with WindowListener {
   }
 
   /// Formats raw or scraped filenames into clean, professional book titles for display.
-  /// Strips repository hashes, publisher tags, and file extensions.
+  /// Strips repository hashes, publisher tags, curly brace tags, libgen tags, and file extensions.
   static String formatCleanBookTitle(String rawName) {
     var title = rawName.trim();
-    // Decode common HTML entities (e.g. &#039; in O'Reilly)
-    title = title.replaceAll(RegExp(r'O\s*&\s*0*39\s*;?\s*Reilly', caseSensitive: false), "O'Reilly");
+
+    // 1. Decode common HTML entities and corrupt character sequences (e.g. O&_039_Reilly, O&#039;Reilly, O& 039 ;)
+    title = title.replaceAll(RegExp(r'O\s*&\s*[_#]?0*39\s*[_#;]?\s*Reilly', caseSensitive: false), "O'Reilly");
     title = title.replaceAll(RegExp(r'O\s*&\s*Reilly', caseSensitive: false), "O'Reilly");
+    title = title.replaceAll(RegExp(r'&\s*[_#]?0*39\s*[_#;]?', caseSensitive: false), "'");
     title = title.replaceAll(RegExp(r'&#0*39;|&apos;', caseSensitive: false), "'");
     title = title.replaceAll(RegExp(r'&amp;', caseSensitive: false), '&');
     title = title.replaceAll(RegExp(r'&quot;', caseSensitive: false), '"');
 
-    // Strip leading publication year if bracketed: e.g. "[2022] "
-    title = title.replaceAll(RegExp(r'^\[\d{4}\]\s*'), '');
-    // Strip library hashes and tags: e.g. [Z-Library], [libgen], (z-lib.org)
-    title = title.replaceAll(RegExp(r'\[(?:z-library|libgen|annas-archive)[^\]]*\]', caseSensitive: false), '');
-    title = title.replaceAll(RegExp(r'\((?:z-lib\.org|libgen|anna.s archive)[^\)]*\)', caseSensitive: false), '');
-    // Strip file extensions
+    // 2. Strip curly brace blocks: {authors}, {isbn/id}, {publisher} e.g. {Prashanth Babu...}, {107716181}
+    title = title.replaceAll(RegExp(r'\{[^\}]*\}'), '');
+
+    // 3. Strip standalone repository / pirate tags before extensions e.g. libgen.li, libgen.lc, z-lib.org
+    title = title.replaceAll(RegExp(r'\b(?:libgen|z-library|annas?-archive|z-lib)(?:\.[a-z]{2,4})?\b', caseSensitive: false), '');
+
+    // 4. Strip bracketed / parenthesized hashes, tags, and years
+    title = title.replaceAll(RegExp(r'\[\s*(?:z-library|libgen|annas?-archive)[^\]]*\]', caseSensitive: false), '');
+    title = title.replaceAll(RegExp(r'\(\s*(?:z-lib\.org|libgen|anna.s archive)[^\)]*\)', caseSensitive: false), '');
+    title = title.replaceAll(RegExp(r'^\s*\[\d{4}\]\s*'), '');
+    title = title.replaceAll(RegExp(r'\(\s*\d{4}\s*(?:,\s*[^)]*)?\)', caseSensitive: false), '');
+
+    // 5. Strip file extensions
     title = title.replaceAll(RegExp(r'\.(?:pdf|docx|txt|epub)$', caseSensitive: false), '');
-    // Strip MD5 / 32-char hex hashes
+
+    // 6. Strip MD5 / 32-char hex hashes
     title = title.replaceAll(RegExp(r'\b[a-f0-9]{32}\b', caseSensitive: false), '');
-    // Strip raw repo / archive prefix tags
+
+    // 7. Strip raw repo / archive prefix tags
     title = title.replaceAll(RegExp(r'^(?:github|repo|books|archive|libgen)[_\s-]+', caseSensitive: false), '');
-    // Strip long ISBN / numeric hashes (e.g. _9781617298516_ or _02834891283 or 978-1-61729-851-6)
+
+    // 8. Strip long ISBN / numeric hashes (e.g. _9781617298516_ or _02834891283 or 978-1-61729-851-6)
     title = title.replaceAll(RegExp(r'[_\s-]*(?:978[-_\s]?\d{9,10}|978[-_\s]?\d{1,5}[-_\s]?\d{1,7}[-_\s]?\d{1,7}[-_\s]?\d|\d{10,13})[_\s-]*'), ' ');
-    // Replace underscores with spaces
+
+    // 9. Replace underscores with spaces
     title = title.replaceAll('_', ' ');
-    // Strip common publisher suffixes at the end
-    title = title.replaceAll(RegExp(r"\s+(?:Manning|OReilly|O'Reilly|Packt|Springer|Wiley|Addison-Wesley|McGraw-Hill|Pearson|Apress).*$", caseSensitive: false), '');
-    // Strip leading/trailing punctuation dashes, colons, or whitespace
+
+    // 10. Strip common publisher suffixes at the end
+    title = title.replaceAll(RegExp(r"\s+(?:Manning|OReilly|O'Reilly(?:\s+Media)?|Packt(?:\s+Publishing)?|Springer|Wiley|Addison-Wesley|McGraw-Hill|Pearson|Apress).*$", caseSensitive: false), '');
+
+    // 11. Strip leading/trailing punctuation dashes, colons, or whitespace
     title = title.replaceAll(RegExp(r'^[-_:\s]+|[-_:\s]+$'), '');
-    // Collapse excess spaces
+
+    // 12. Collapse excess spaces
     title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
     return title.isNotEmpty ? title : rawName;
   }
+
+  /// Extracts a restrictive scope phrase from query (e.g. "in terms of data storage").
+  static String? extractScopePhrase(String query) => PromptBuilder.extractScopePhrase(query);
 
   /// Extracts the most distinctive entity (non-stopwords) from a query.
   /// Guarantees that all sub-queries are strictly anchored to the specific subject.
@@ -880,7 +991,12 @@ class AppState extends ChangeNotifier with WindowListener {
       'comprehensive', 'full', 'all', 'help', 'need', 'want', 'know', 'learn', 'understand',
       'difference', 'differences', 'versus', 'vs', 'between', 'importance', 'best', 'practice',
       'practices', 'example', 'examples', 'use', 'case', 'cases', 'scenario', 'scenarios',
-      'implementation', 'using', 'used', 'with', 'by', 'from', 'for', 'and', 'or', 'not'
+      'implementation', 'using', 'used', 'with', 'by', 'from', 'for', 'and', 'or', 'not',
+      'accommodate', 'accomodate', 'support', 'supports', 'handle', 'handles',
+      'store', 'stores', 'storing', 'processing',
+      'allow', 'allows', 'contain', 'contains', 'like', 'such', 'as',
+      'including', 'capable', 'capability', 'capabilities', 'able', 'ability',
+      'feature', 'features', 'hold', 'holds', 'holding',
     };
     final words = query
         .replaceAll(RegExp(r'[^\w\s\-]'), ' ')
@@ -900,6 +1016,11 @@ class AppState extends ChangeNotifier with WindowListener {
       return capitalized.join(' ');
     }
 
+    // If long phrase (> 4 words), bound to the primary subject noun phrase
+    if (nonStopWords.length > 4) {
+      return nonStopWords.take(4).join(' ');
+    }
+
     return nonStopWords.join(' ');
   }
 
@@ -910,20 +1031,28 @@ class AppState extends ChangeNotifier with WindowListener {
 
     // Pattern 1: "Difference(s) between <A> and <B>"
     final diffMatch = RegExp(
-      r'\bdiffer(?:ence|ences)?\s+between\s+(.+?)\s+(?:and|&|vs\.?|versus)\s+(.+?)(?:\?|$|\.|\bin\b)',
+      r'\bdiffer(?:ence|ences)?\s+between\s+(.+?)\s+(?:and|&|vs\.?|versus)\s+(.+?)(?:\?|$|\.|\bin\b|\bregarding\b|\bwith\b|\bfocusing\b)',
       caseSensitive: false,
     ).firstMatch(clean);
     if (diffMatch != null) {
-      final a = extractCoreEntity(diffMatch.group(1)!);
-      final b = extractCoreEntity(diffMatch.group(2)!);
+      var a = extractCoreEntity(diffMatch.group(1)!);
+      var b = extractCoreEntity(diffMatch.group(2)!);
       if (a.isNotEmpty && b.isNotEmpty && a.toLowerCase() != b.toLowerCase()) {
+        final bWords = b.split(RegExp(r'\s+'));
+        if (bWords.length > 1 && a.split(RegExp(r'\s+')).length == 1) {
+          final headNoun = bWords.sublist(1).join(' ');
+          final aAdj = a.toLowerCase();
+          if (const {'traditional', 'modern', 'legacy', 'cloud', 'relational', 'distributed', 'centralized', 'static', 'dynamic'}.contains(aAdj)) {
+            a = '$a $headNoun';
+          }
+        }
         return {'entityA': a, 'entityB': b};
       }
     }
 
     // Pattern 2: "<A> vs <B>" or "<A> versus <B>"
     final vsMatch = RegExp(
-      r'(.+?)\s+(?:\bvs\.?\b|\bversus\b)\s+(.+?)(?:\?|$|\.|\bin\b)',
+      r'(.+?)\s+(?:\bvs\.?\b|\bversus\b)\s+(.+?)(?:\?|$|\.|\bin\b|\bregarding\b|\bwith\b|\bfocusing\b)',
       caseSensitive: false,
     ).firstMatch(clean);
     if (vsMatch != null) {
@@ -936,7 +1065,7 @@ class AppState extends ChangeNotifier with WindowListener {
 
     // Pattern 3: "Compare <A> (and|with|to) <B>"
     final compMatch = RegExp(
-      r'\bcompare\s+(.+?)\s+(?:and|with|to|vs\.?|versus)\s+(.+?)(?:\?|$|\.|\bin\b)',
+      r'\bcompare\s+(.+?)\s+(?:and|with|to|vs\.?|versus)\s+(.+?)(?:\?|$|\.|\bin\b|\bregarding\b|\bwith\b|\bfocusing\b)',
       caseSensitive: false,
     ).firstMatch(clean);
     if (compMatch != null) {
@@ -951,8 +1080,54 @@ class AppState extends ChangeNotifier with WindowListener {
   }
 
   /// Builds balanced retrieval facets for comparing two distinct technologies or concepts.
-  /// Guarantees that both sides of the comparison receive dedicated candidate pools and cross-encoder evaluation.
-  static List<Map<String, String>> buildFacetsForComparison(String entityA, String entityB) {
+  /// When a restrictive `scope` is present (e.g. "data storage"), strictly anchors all facets to that scope.
+  static List<Map<String, String>> buildFacetsForComparison(
+    String entityA,
+    String entityB, {
+    String? scope,
+  }) {
+    if (scope != null && scope.trim().isNotEmpty) {
+      final s = scope.trim();
+      return [
+        {
+          'label': '$entityA $s Architecture',
+          'bm25Query': '$entityA $s storage structure format design scaling files',
+          'rerankQuery': 'What is the architecture, design, and mechanisms of $s in $entityA?',
+          'anchor': entityA,
+        },
+        {
+          'label': '$entityB $s Architecture',
+          'bm25Query': '$entityB $s storage structure format design scaling files',
+          'rerankQuery': 'What is the architecture, design, and mechanisms of $s in $entityB?',
+          'anchor': entityB,
+        },
+        {
+          'label': '$entityA Format & Schema in $s',
+          'bm25Query': '$entityA $s format schema files layout types compression row column',
+          'rerankQuery': 'What data formats, schema enforcement, and physical layout are used for $s in $entityA?',
+          'anchor': entityA,
+        },
+        {
+          'label': '$entityB Format & Schema in $s',
+          'bm25Query': '$entityB $s format schema files layout types compression row column',
+          'rerankQuery': 'What data formats, schema enforcement, and physical layout are used for $s in $entityB?',
+          'anchor': entityB,
+        },
+        {
+          'label': '$s Comparison & Key Differences',
+          'bm25Query': '$entityA $entityB $s difference comparison contrast storage trade-offs',
+          'rerankQuery': 'What are the main differences and trade-offs between $entityA and $entityB in terms of $s?',
+          'anchor': '$entityA $entityB',
+        },
+        {
+          'label': 'Cost, Capacity & Scaling of $s',
+          'bm25Query': '$entityA $entityB $s cost scaling capacity storage economics tiering',
+          'rerankQuery': 'How do $entityA and $entityB differ in cost, capacity scaling, and economics for $s?',
+          'anchor': '$entityA $entityB',
+        },
+      ];
+    }
+
     return [
       {
         'label': '$entityA Architecture & Purpose',
@@ -967,15 +1142,15 @@ class AppState extends ChangeNotifier with WindowListener {
         'anchor': entityB,
       },
       {
-        'label': '$entityA Workloads & Data Modeling',
-        'bm25Query': '$entityA workloads queries structured storage modeling analytics',
-        'rerankQuery': 'What are typical workloads, queries, and data types for $entityA?',
+        'label': '$entityA Architecture & Workloads',
+        'bm25Query': '$entityA architecture design storage workloads processing structure',
+        'rerankQuery': 'What is the architecture, design, and typical workload patterns for $entityA?',
         'anchor': entityA,
       },
       {
-        'label': '$entityB Workloads & File Storage',
-        'bm25Query': '$entityB workloads files unstructured storage processing science',
-        'rerankQuery': 'What are typical workloads, storage formats, and data types for $entityB?',
+        'label': '$entityB Architecture & Workloads',
+        'bm25Query': '$entityB architecture design storage workloads processing structure',
+        'rerankQuery': 'What is the architecture, design, and typical workload patterns for $entityB?',
         'anchor': entityB,
       },
       {
@@ -985,9 +1160,9 @@ class AppState extends ChangeNotifier with WindowListener {
         'anchor': '$entityA $entityB',
       },
       {
-        'label': 'Cost, Scaling & Storage Economics',
-        'bm25Query': '$entityA $entityB cost scaling scale storage compute decoupled object s3 hdfs cluster economics',
-        'rerankQuery': 'How do $entityA and $entityB differ in cost, scaling, and storage architecture (decoupled compute vs clusters)?',
+        'label': 'Cost, Scaling & Resource Architecture',
+        'bm25Query': '$entityA $entityB cost scaling scale storage compute resource performance throughput latency economics',
+        'rerankQuery': 'How do $entityA and $entityB differ in cost, scaling, and resource architecture (decoupled compute vs clusters)?',
         'anchor': '$entityA $entityB',
       },
     ];
@@ -999,46 +1174,59 @@ class AppState extends ChangeNotifier with WindowListener {
   /// - `rerankQuery`: Natural question for ONNX MiniLM cross-encoder scoring.
   static List<Map<String, String>> buildFacetsForTopic(String query) {
     final entity = extractCoreEntity(query);
+    final isEvolutionQuery = RegExp(
+      r'\b(?:evolution|history|historical|modern|future|version|versions|v\d|roadmap|migration)\b',
+      caseSensitive: false,
+    ).hasMatch(query);
 
     return [
       {
-        'label': 'Definition, Raw Data & Core Architecture',
-        'bm25Query': '$entity definition overview purpose raw data structured unstructured semistructured volume variety store',
-        'rerankQuery': 'What is the definition, core architecture, and raw data types (structured, semistructured, unstructured) of $entity?',
+        'label': 'Definition, Core Concept & Architecture',
+        'bm25Query': '$entity definition overview purpose core concept architecture foundation',
+        'rerankQuery': 'What is the definition, core purpose, and fundamental architecture of $entity?',
         'anchor': entity,
       },
       {
-        'label': 'Foundational Infrastructure & Storage Evolution',
-        'bm25Query': '$entity infrastructure storage compute separation Hadoop HDFS cloud object storage S3 ADLS GCS commodity',
-        'rerankQuery': 'What is the foundational infrastructure and storage evolution of $entity (Hadoop HDFS vs cloud object storage S3 ADLS)?',
+        'label': 'Foundational Infrastructure & System Components',
+        'bm25Query': '$entity infrastructure components architecture system scheduler executor worker process engine server database runtime foundation',
+        'rerankQuery': 'What is the foundational infrastructure, runtime environment, and core system components of $entity?',
         'anchor': entity,
       },
       {
-        'label': 'Data Formats & Schema Handling',
-        'bm25Query': '$entity formats Parquet ORC CSV JSON columnar schema-on-read schema storage native',
-        'rerankQuery': 'What storage file formats (Parquet, ORC, CSV, JSON) and schema strategies (schema-on-read) are used in $entity?',
+        'label': 'Data Formats, Schemas & Specifications',
+        'bm25Query': '$entity formats specifications schema protocol data structures representation types serialization interface standards',
+        'rerankQuery': 'What data formats, specifications, schemas, or protocols are used in $entity?',
         'anchor': entity,
       },
       {
-        'label': 'Processing Engines & Interoperability',
-        'bm25Query': '$entity query processing engines Spark Presto Trino interoperability execution downstream tools external tables',
-        'rerankQuery': 'How does $entity interoperate with query and processing engines like Spark, Presto, or data warehouses?',
+        'label': 'Execution Engines & Ecosystem Interoperability',
+        'bm25Query': '$entity execution processing engines tools interoperability integration ecosystem downstream pipelines workflows',
+        'rerankQuery': 'How does $entity interoperate with execution and processing engines, tools, or downstream systems?',
         'anchor': entity,
       },
       {
         'label': 'Operational Limitations & Challenges',
-        'bm25Query': '$entity limitations challenges transactional updates deletes small files governance ACID consistency',
-        'rerankQuery': 'What are the operational challenges, lack of transactional controls (updates/deletes), or limitations of $entity?',
+        'bm25Query': '$entity limitations challenges bottlenecks constraints failure modes trade-offs risks governance overhead',
+        'rerankQuery': 'What are the operational challenges, failure modes, trade-offs, or architectural limitations of $entity?',
         'anchor': entity,
       },
-      {
-        'label': 'Modern Evolution & Lakehouses',
-        'bm25Query': '$entity lakehouse evolution convergence modern ACID transactions table formats Delta Iceberg metadata',
-        'rerankQuery': 'How does $entity evolve into modern lakehouses with ACID transactions, metadata layers, and table formats?',
-        'anchor': entity,
-      },
+      if (isEvolutionQuery)
+        {
+          'label': 'Modern Evolution & Advanced Standards',
+          'bm25Query': '$entity evolution modern alternatives extensions advanced patterns convergence standards next-generation',
+          'rerankQuery': 'How has $entity evolved over time, and what modern patterns, standards, or advanced extensions have emerged?',
+          'anchor': entity,
+        }
+      else
+        {
+          'label': 'Execution Lifecycle & Workflow Scheduling',
+          'bm25Query': '$entity execution lifecycle workflow scheduling state transitions task queue dispatch poll trigger worker heartbeat run process',
+          'rerankQuery': 'How does the execution lifecycle, task scheduling, workflow state transitions, and queue dispatch operate in $entity?',
+          'anchor': entity,
+        },
     ];
   }
+
 
   static const Set<String> _citationStopWords = {
     'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'and', 'or',
@@ -1104,8 +1292,9 @@ class AppState extends ChangeNotifier with WindowListener {
   }
 
   static Set<String> _extractContentWords(String s) {
-    // Strip inline math expressions ($...$) and code ticks so formula syntax doesn't distort lexical matching
+    // Strip XML tags (<...>), inline math expressions ($...$), and code ticks so syntax doesn't distort lexical matching
     final textNoMath = s
+        .replaceAll(RegExp(r'<[^>]+>'), ' ')
         .replaceAll(RegExp(r'\$[^$\n]+\$'), ' ')
         .replaceAll(RegExp(r'`[^`\n]+`'), ' ');
     return textNoMath
@@ -1117,6 +1306,47 @@ class AppState extends ChangeNotifier with WindowListener {
         .toSet();
   }
 
+  /// Checks sentences containing causal words ("due to", "because", etc.) against the cited chunk words.
+  /// If the causal reasoning clause lacks evidence overlap with the cited chunks, drops the ungrounded clause.
+  static String checkAndCleanUngroundedCausation(
+    String sentence,
+    List<Set<String>> citedChunkWordSets,
+  ) {
+    if (citedChunkWordSets.isEmpty) return sentence;
+
+    final causalRegex = RegExp(
+      r'([,\s]+)\b(?:due\s+to|owing\s+to|as\s+a\s+result\s+of|because\s+(?:of\s+)?)\s+([^,.;\[\]]+)',
+      caseSensitive: false,
+    );
+
+    final match = causalRegex.firstMatch(sentence);
+    if (match == null) return sentence;
+
+    final reasonText = match.group(2)!.trim();
+    final reasonWords = _extractContentWords(reasonText);
+    if (reasonWords.isEmpty) return sentence;
+
+    // Check overlap of the reason words against all cited chunks
+    int maxMatches = 0;
+    for (final cWords in citedChunkWordSets) {
+      final matches = reasonWords.intersection(cWords).length;
+      if (matches > maxMatches) {
+        maxMatches = matches;
+      }
+    }
+
+    final minNeeded = reasonWords.length <= 2 ? 1 : 2;
+    if (maxMatches < minNeeded) {
+      print('[DROP UNGROUNDED CAUSATION] In "$sentence": reason "$reasonText" lacked evidence (matches=$maxMatches, needed=$minNeeded)');
+      var cleaned = sentence.replaceRange(match.start, match.end, '');
+      cleaned = cleaned.replaceAllMapped(RegExp(r'(\w)\['), (m) => '${m[1]} [');
+      cleaned = cleaned.replaceAll(RegExp(r'\s{2,}'), ' ').trim();
+      return cleaned;
+    }
+
+    return sentence;
+  }
+
   /// Post-processes generated response:
   /// 1. Strips model-generated citations and assigns deterministic citations via word overlap against rawChunks.
   /// 2. Drops sentences that fail overlap threshold (unsupported claims / hallucinated rationales).
@@ -1124,7 +1354,11 @@ class AppState extends ChangeNotifier with WindowListener {
   /// 4. Completely removes filler "Technical Terms" / "Glossary" sections.
   /// 5. Exempts valid Markdown tables and LaTeX math blocks from lexical deletion.
   /// 6. Cleans up orphaned or empty headings.
-  static String enforceCitationsAndCleanOutput(String text, {List<String>? rawChunks}) {
+  static String enforceCitationsAndCleanOutput(
+    String text, {
+    List<String>? rawChunks,
+    AnswerUseCase? useCase,
+  }) {
     if (text.trim().isEmpty) return text;
     if (text.startsWith("This topic is not covered in your books")) return text;
 
@@ -1190,6 +1424,19 @@ class AppState extends ChangeNotifier with WindowListener {
           cleanedLines.add(trimmed);
           continue;
         } else {
+          // If in comparison mode, only allow Overview and Key Differences
+          if (useCase == AnswerUseCase.comparison) {
+            final isAllowedComparison = RegExp(
+              r'^(?:overview|key\s+differences|differences|key\s+comparison|comparison)\b',
+              caseSensitive: false,
+            ).hasMatch(headingTitle);
+            if (!isAllowedComparison) {
+              inBannedSection = false;
+              inExemptSection = false;
+              inDefinitionSection = false;
+              continue; // Drop invented off-scope headings in comparison mode
+            }
+          }
           inBannedSection = false;
           inExemptSection = false;
           inDefinitionSection = false;
@@ -1273,6 +1520,8 @@ class AppState extends ChangeNotifier with WindowListener {
 
         var cleanedSentence = _cleanInternalRepetition(rawSentence);
         cleanedSentence = AnswerSanitizer.correctSchemaOverstatements(cleanedSentence);
+        cleanedSentence = AnswerSanitizer.correctTechnicalContradictions(cleanedSentence);
+        cleanedSentence = AnswerSanitizer.sanitizeInformalTropes(cleanedSentence);
 
         final cleanSentenceText = cleanedSentence
             .replaceAll(RegExp(r'\[\s*(?:\d+|[a-zA-Z])+(?:\s*,\s*(?:\d+|[a-zA-Z])+)*\s*\]'), '')
@@ -1372,7 +1621,8 @@ class AppState extends ChangeNotifier with WindowListener {
           for (final cite in modelCites) {
             final cIdx = cite - 1;
             final mCount = chunkMatches[cIdx] ?? 0;
-            if (mCount >= minMatchesNeeded && (mCount >= bestMatchCount - 1 || mCount >= 3)) {
+            final mRecall = chunkRecalls[cIdx] ?? 0.0;
+            if (mCount >= minMatchesNeeded && (mCount >= bestMatchCount - 1 || mRecall >= 0.25)) {
               verifiedChunks.add(cIdx);
             }
           }
@@ -1390,27 +1640,33 @@ class AppState extends ChangeNotifier with WindowListener {
             for (int cIdx = 0; cIdx < chunkWordSets.length; cIdx++) {
               if (cIdx == primaryIdx) continue;
               final novelMatches = sWords.intersection(chunkWordSets[cIdx]).difference(primaryMatchedWords);
-              // Second chunk must contribute >= 2 novel distinct matching words and have >= 2 total matches
-              if (novelMatches.length >= 2 && (chunkMatches[cIdx] ?? 0) >= 2) {
+              final totalMatches = chunkMatches[cIdx] ?? 0;
+              final recall = chunkRecalls[cIdx] ?? 0.0;
+              // Second chunk must contribute >= 2 novel distinct matching words and have substantive overlap
+              if (novelMatches.length >= 2 && totalMatches >= 3 && (recall >= 0.20 || modelCites.contains(cIdx + 1))) {
                 verifiedChunks.add(cIdx);
                 break; // Cap at 2 supporting excerpts for readable, clean citations [1, 2]
               }
             }
           }
 
+          // Clean ungrounded causal clauses ("due to", "because") if cited chunks lack evidence
+          final citedChunkWordSets = verifiedChunks.map((idx) => chunkWordSets[idx]).toList();
+          final causallyCleaned = checkAndCleanUngroundedCausation(cleanSentenceText, citedChunkWordSets);
+
           final sortedCiteList = (verifiedChunks.map((idx) => idx + 1).toList()..sort());
           final citeString = sortedCiteList.isNotEmpty
               ? '[${sortedCiteList.join(", ")}]'
               : '[1]';
 
-          final cited = '$cleanSentenceText $citeString.';
+          final cited = '$causallyCleaned $citeString.';
           acceptedSentences.add(cited);
           seenSentenceWordSets.add(compareWords);
           if (inDefinitionSection) {
             seenDefinitionWordSets.add(compareWords);
-            print('[VERIFIER DEFINITION] "$cleanSentenceText" -> $citeString (matches=$bestMatchCount, recall=${bestRecall.toStringAsFixed(2)})');
+            print('[VERIFIER DEFINITION] "$causallyCleaned" -> $citeString (matches=$bestMatchCount, recall=${bestRecall.toStringAsFixed(2)})');
           } else {
-            print('[VERIFIER PRESERVE] "$cleanSentenceText" -> $citeString');
+            print('[VERIFIER PRESERVE] "$causallyCleaned" -> $citeString');
           }
         } else {
           acceptedSentences.add('$cleanSentenceText.');
@@ -1455,6 +1711,134 @@ class AppState extends ChangeNotifier with WindowListener {
     return result.isNotEmpty 
         ? result 
         : 'This topic has limited direct coverage in your uploaded books. No verified claims could be established from the retrieved excerpts.';
+  }
+
+  /// Builds relevant passages for UI display and audit trail.
+  /// Instead of showing static introductory snippet prefixes, it locates the specific
+  /// sentence or 1-2 sentence window in each retrieved chunk that has the highest
+  /// lexical overlap with the claim(s) in responseText that cite this chunk.
+  static List<Map<String, String>> buildBestMatchingPassages({
+    required List<Map<String, dynamic>> allResults,
+    required String responseText,
+    required String query,
+  }) {
+    final passages = <Map<String, String>>[];
+    if (allResults.isEmpty) return passages;
+
+    // Split response into sentences
+    final responseSentences = responseText
+        .split(RegExp(r'(?<=[.!?])\s+'))
+        .where((s) => s.trim().length > 6)
+        .toList();
+
+    for (int i = 0; i < allResults.length; i++) {
+      final result = allResults[i];
+      final content = result['content'] as String? ?? '';
+      if (content.trim().isEmpty) continue;
+
+      final metadata = result['metadata'] as Map<String, dynamic>? ?? {};
+      final rawYear = metadata['publication_year'];
+      final hasValidYear = rawYear != null &&
+          rawYear.toString() != '0000' &&
+          rawYear.toString() != 'Unknown Year' &&
+          int.tryParse(rawYear.toString()) != null &&
+          int.parse(rawYear.toString()) > 1990;
+      final yearDisplay = hasValidYear ? rawYear.toString() : 'N/A';
+      final rawFilename = metadata['virtual_filename'] ?? metadata['filename'] ?? 'unknown';
+      final cleanTitle = formatCleanBookTitle(rawFilename.toString());
+      final facetLabel = result['facet_label'] as String? ?? 'General';
+
+      final citationIndex = i + 1;
+      final citePattern = RegExp(
+        r'\[\s*(?:\d+\s*,\s*)*' + '$citationIndex' + r'(?:\s*,\s*\d+)*\s*\]',
+      );
+
+      // Find all sentences in responseText that cite this chunk [citationIndex]
+      final citingSentences = responseSentences.where((s) => citePattern.hasMatch(s)).toList();
+
+      // Collect target words for matching:
+      // If citing sentences exist, match against their content words.
+      // Otherwise, match against the query/coreEntity words.
+      Set<String> targetWords;
+      if (citingSentences.isNotEmpty) {
+        targetWords = _extractContentWords(citingSentences.join(' '));
+      } else {
+        targetWords = _extractContentWords(query);
+      }
+
+      // Split chunk content into candidate sentences
+      final rawChunkSentences = content
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .split(RegExp(r'(?<=[.!?])\s+'))
+          .map((s) => s.trim())
+          .where((s) => s.length > 15)
+          .toList();
+
+      String bestText = '';
+      if (rawChunkSentences.isNotEmpty && targetWords.isNotEmpty) {
+        int highestOverlap = -1;
+        int bestIdx = 0;
+
+        for (int sIdx = 0; sIdx < rawChunkSentences.length; sIdx++) {
+          final sWords = _extractContentWords(rawChunkSentences[sIdx]);
+          final overlap = sWords.intersection(targetWords).length;
+          if (overlap > highestOverlap) {
+            highestOverlap = overlap;
+            bestIdx = sIdx;
+          }
+        }
+
+        // Take the best sentence. If it's short (< 120 chars) and there's a next sentence, combine them
+        final primarySentence = rawChunkSentences[bestIdx];
+        if (primarySentence.length < 120 && bestIdx + 1 < rawChunkSentences.length) {
+          bestText = '$primarySentence ${rawChunkSentences[bestIdx + 1]}';
+        } else {
+          bestText = primarySentence;
+        }
+
+        // Cap to reasonable length (e.g. 500 chars) with clean word boundary
+        if (bestText.length > 500) {
+          final cutoff = bestText.lastIndexOf(' ', 500);
+          bestText = '${bestText.substring(0, cutoff > 300 ? cutoff : 500).trim()}...';
+        }
+      }
+
+      // If no good match was found or chunk had no sentences, use fallback snippet
+      if (bestText.trim().isEmpty) {
+        bestText = _formatFallbackSnippet(content, query, maxLen: 500);
+      }
+
+      passages.add({
+        'index': '$citationIndex',
+        'book': cleanTitle,
+        'year': yearDisplay,
+        'facet': facetLabel,
+        'text': bestText,
+      });
+    }
+
+    return passages;
+  }
+
+  static String _formatFallbackSnippet(String text, String entity, {int maxLen = 500}) {
+    final clean = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (clean.length <= maxLen) return clean;
+
+    final entityLower = entity.toLowerCase();
+    final cleanLower = clean.toLowerCase();
+    final entityIdx = cleanLower.indexOf(entityLower);
+
+    if (entityIdx > 200 && entityIdx < clean.length - 50) {
+      final start = clean.lastIndexOf(' ', math.max(0, entityIdx - 80));
+      final safeStart = start != -1 ? start + 1 : math.max(0, entityIdx - 80);
+      final end = clean.indexOf(' ', math.min(clean.length - 1, safeStart + maxLen));
+      final safeEnd = end != -1 ? end : math.min(clean.length, safeStart + maxLen);
+      return '...${clean.substring(safeStart, safeEnd).trim()}...';
+    }
+
+    final truncated = clean.substring(0, maxLen);
+    final lastSpace = truncated.lastIndexOf(' ');
+    return '${(lastSpace > 350 ? truncated.substring(0, lastSpace) : truncated).trim()}...';
   }
 
   /// Generates suggested follow-up questions grounded in unused high-scoring candidates

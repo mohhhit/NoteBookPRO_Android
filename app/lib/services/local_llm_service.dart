@@ -183,14 +183,15 @@ class LocalLlmService {
     final lastUserMsg = history.lastWhere((msg) => msg.role == 'user', orElse: () => history.last);
     final userQuery = lastUserMsg.content;
     final uc = explicitUseCase ?? PromptBuilder.inferUseCase(userQuery);
+    final scope = PromptBuilder.extractScopePhrase(userQuery);
 
     final preparedChunks = PromptBuilder.prepareChunks(safeChunks, userQuery);
-    final systemText = PromptBuilder.buildSystemPrompt(uc, chunks: preparedChunks);
-    final userPromptText = PromptBuilder.buildUserMessage(userQuery, preparedChunks, uc);
+    final systemText = PromptBuilder.buildSystemPrompt(uc, chunks: preparedChunks, scope: scope);
+    final userPromptText = PromptBuilder.buildUserMessage(userQuery, preparedChunks, uc, scope: scope);
 
     final approxPromptTokens = ((systemText.length + userPromptText.length) / 3.8).round();
 
-    print('\n================ EXACT LLM PROMPT DUMP (use_case=$uc, engine=${_isLiteLm ? "LiteRT-LM" : "LlamaCpp"}) ================');
+    print('\n================ EXACT LLM PROMPT DUMP (use_case=$uc, scope=$scope, engine=${_isLiteLm ? "LiteRT-LM" : "LlamaCpp"}) ================');
     print('[LLM_TIMING] estimated_prompt_tokens=~$approxPromptTokens history_turns=${history.length}');
     print('--- SYSTEM INSTRUCTION ---');
     print(systemText);

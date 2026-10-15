@@ -1579,12 +1579,15 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
 
         final message = messages[index];
         final isUser = message.role == 'user';
+        final parsed = isUser
+            ? ParsedMessageContent(mainContent: message.content)
+            : parseMessagePassages(message.content);
         final displayContent = isUser
-            ? message.content
-            : _stripInlineDocumentReferences(message.content);
+            ? parsed.mainContent
+            : _stripInlineDocumentReferences(parsed.mainContent);
         final citationNumbers = isUser
             ? const <int>[]
-            : _extractDocumentReferenceNumbers(message.content);
+            : _extractDocumentReferenceNumbers(parsed.mainContent);
 
         if (!isUser &&
             message.content.trim().isEmpty &&
@@ -1831,6 +1834,13 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
                     context,
                     citationNumbers,
                     message.sources,
+                  ),
+                if (parsed.passagesContent != null &&
+                    parsed.passagesContent!.isNotEmpty)
+                  RelevantPassagesDropdown(
+                    passagesMarkdown: parsed.passagesContent!,
+                    count: parsed.passageCount,
+                    mathNormalizer: _normalizeMathMarkup,
                   ),
                 if ((message.suggestedFollowUps ?? const <String>[]).isNotEmpty)
                   _buildSuggestedFollowUps(
@@ -2145,14 +2155,20 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
     int docNumber,
     dynamic source,
   ) {
-    final metadata = source is Map<String, dynamic>
-        ? (source['metadata'] as Map<String, dynamic>?)
+    final metadata = source is Map
+        ? (source['metadata'] as Map?)
         : null;
-    final filename = metadata?['filename']?.toString() ?? 'Unknown source';
-    final snippet = source is Map<String, dynamic>
-        ? (source['content']?.toString() ?? 'No snippet available.')
-        : 'No snippet available.';
-    final score = source is Map<String, dynamic> ? source['score'] : null;
+    final book = (source is Map ? source['book'] : null)?.toString();
+    final filename = book ??
+        metadata?['filename']?.toString() ??
+        'Unknown source';
+    final facet = (source is Map ? source['facet'] : null)?.toString();
+    final year = (source is Map ? source['year'] : null)?.toString();
+    final yr = (year != null && year != 'N/A' && year.isNotEmpty) ? ' ($year)' : '';
+    final snippet = (source is Map ? source['text'] : null)?.toString() ??
+        (source is Map ? source['content'] : null)?.toString() ??
+        'No snippet available.';
+    final score = source is Map ? source['score'] : null;
 
     showModalBottomSheet<void>(
       context: context,
@@ -2176,12 +2192,23 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
               ),
               const SizedBox(height: 8),
               Text(
-                filename,
+                '$filename$yr',
                 style: const TextStyle(
                   color: Color(0xFF8AB4F8),
                   fontWeight: FontWeight.w500,
                 ),
               ),
+              if (facet != null && facet.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  facet,
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    fontStyle: FontStyle.italic,
+                    color: Color(0xFFBDC1C6),
+                  ),
+                ),
+              ],
               if (score != null) ...[
                 const SizedBox(height: 6),
                 Text(
@@ -2930,4 +2957,250 @@ Text(appState.uploadStatus.isEmpty ? 'Please wait...' : appState.uploadStatus, s
     );
   }
 }
+
+class ParsedMessageContent {
+  final String mainContent;
+  final String? passagesContent;
+  final int passageCount;
+
+  const ParsedMessageContent({
+    required this.mainContent,
+    this.passagesContent,
+    this.passageCount = 0,
+  });
+}
+
+ParsedMessageContent parseMessagePassages(String content) {
+  final passageRegex = RegExp(
+    r'(?:\r?\n\s*---\s*)?\r?\n#{2,4}\s*Relevant Passages:?\s*',
+    caseSensitive: false,
+  );
+
+  final match = passageRegex.firstMatch(content);
+  if (match == null) {
+    final altRegex = RegExp(
+      r'^#{2,4}\s*Relevant Passages:?\s*',
+      caseSensitive: false,
+    );
+    final altMatch = altRegex.firstMatch(content);
+    if (altMatch != null) {
+      final passages = content.substring(altMatch.end).trim();
+      final count = RegExp(r'(?:\*\*\[|\[)\d+\]').allMatches(passages).length;
+      return ParsedMessageContent(
+        mainContent: '',
+        passagesContent: passages.isNotEmpty ? passages : null,
+        passageCount: count,
+      );
+    }
+    return ParsedMessageContent(mainContent: content);
+  }
+
+  final mainText = content.substring(0, match.start).trim();
+  final passagesText = content.substring(match.end).trim();
+  final count = RegExp(r'(?:\*\*\[|\[)\d+\]').allMatches(passagesText).length;
+
+  return ParsedMessageContent(
+    mainContent: mainText,
+    passagesContent: passagesText.isNotEmpty ? passagesText : null,
+    passageCount: count,
+  );
+}
+
+class RelevantPassagesDropdown extends StatefulWidget {
+  final String passagesMarkdown;
+  final int count;
+  final String Function(String)? mathNormalizer;
+
+  const RelevantPassagesDropdown({
+    super.key,
+    required this.passagesMarkdown,
+    required this.count,
+    this.mathNormalizer,
+  });
+
+  @override
+  State<RelevantPassagesDropdown> createState() =>
+      _RelevantPassagesDropdownState();
+}
+
+class _RelevantPassagesDropdownState extends State<RelevantPassagesDropdown> {
+  bool _isExpanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final countLabel = widget.count > 0
+        ? '${widget.count} source${widget.count == 1 ? '' : 's'}'
+        : null;
+
+    final normalizedPassages = widget.mathNormalizer != null
+        ? widget.mathNormalizer!(widget.passagesMarkdown)
+        : widget.passagesMarkdown;
+
+    return Container(
+      margin: const EdgeInsets.only(top: 10, bottom: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E222A),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color:
+              _isExpanded ? const Color(0xFF4A5568) : const Color(0xFF2E3440),
+          width: 1.0,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: () {
+                setState(() {
+                  _isExpanded = !_isExpanded;
+                });
+              },
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.menu_book_rounded,
+                      size: 17,
+                      color: Color(0xFF8AB4F8),
+                    ),
+                    const SizedBox(width: 10),
+                    const Text(
+                      'Relevant Passages',
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFFE8EAED),
+                        letterSpacing: 0.1,
+                      ),
+                    ),
+                    if (countLabel != null) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF282F3D),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFF3B4456),
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Text(
+                          countLabel,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Color(0xFF9AA0A6),
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
+                    const Spacer(),
+                    AnimatedRotation(
+                      turns: _isExpanded ? 0.5 : 0.0,
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeInOut,
+                      child: const Icon(
+                        Icons.keyboard_arrow_down_rounded,
+                        size: 20,
+                        color: Color(0xFF9AA0A6),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeInOut,
+            alignment: Alignment.topCenter,
+            child: _isExpanded
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Divider(
+                        height: 1,
+                        thickness: 1,
+                        color: Color(0xFF2A313E),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+                        color: const Color(0xFF15181F),
+                        child: MarkdownBody(
+                          data: normalizedPassages,
+                          selectable: true,
+                          extensionSet: md.ExtensionSet.gitHubFlavored,
+                          inlineSyntaxes: [
+                            _BlockMathSyntax(),
+                            _InlineMathSyntax()
+                          ],
+                          builders: {
+                            'math-inline': _MathElementBuilder(isBlock: false),
+                            'math-block': _MathElementBuilder(isBlock: true),
+                          },
+                          styleSheet: MarkdownStyleSheet(
+                            p: const TextStyle(
+                              fontSize: 13,
+                              height: 1.55,
+                              color: Color(0xFFD0D4DC),
+                            ),
+                            strong: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF8AB4F8),
+                            ),
+                            em: const TextStyle(
+                              fontSize: 12.5,
+                              fontStyle: FontStyle.italic,
+                              color: Color(0xFFBDC1C6),
+                            ),
+                            blockquote: const TextStyle(
+                              fontSize: 12.5,
+                              height: 1.55,
+                              color: Color(0xFFB0BEC5),
+                              fontStyle: FontStyle.italic,
+                            ),
+                            blockquoteDecoration: BoxDecoration(
+                              color: const Color(0xFF1E232D),
+                              border: const Border(
+                                left: BorderSide(
+                                  color: Color(0xFF4A72B2),
+                                  width: 3,
+                                ),
+                              ),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            blockquotePadding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 7,
+                            ),
+                            code: TextStyle(
+                              fontSize: 12,
+                              color: Colors.green.shade200,
+                              backgroundColor: const Color(0xFF121418),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 

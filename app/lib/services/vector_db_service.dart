@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:path/path.dart' as p;
@@ -184,8 +185,31 @@ class VectorDbService {
   }
 
   static bool _isChunkTechnicalNoise(String text) {
-    final lines = text.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+    // 1. Strip the chunk metadata header ('Source Document: ...\n---\n' and '[Section: ...]')
+    // so headers and horizontal rules are NEVER misclassified as noise!
+    var body = text;
+    if (body.startsWith('Source Document:')) {
+      final sepIdx = body.indexOf('\n---\n');
+      if (sepIdx != -1) {
+        body = body.substring(sepIdx + 5).trim();
+      }
+    }
+    if (body.startsWith('[Section:') && body.contains(']\n')) {
+      final closeIdx = body.indexOf(']\n');
+      if (closeIdx != -1) {
+        body = body.substring(closeIdx + 2).trim();
+      }
+    }
+
+    final lines = body.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
     if (lines.isEmpty) return true;
+
+    // Fast-pass: If the body contains substantial English prose (e.g. >= 35 letters with good character density),
+    // and is not a raw terminal command script, it is legitimate explanatory content!
+    final letters = RegExp(r'[A-Za-z]').allMatches(body).length;
+    final digits = RegExp(r'\d').allMatches(body).length;
+    if (letters < 35) return true;
+    if (digits > 0 && letters < math.max(60, (digits * 0.35).toInt())) return true;
 
     int noiseLineCount = 0;
     int commandCount = 0;
@@ -200,11 +224,11 @@ class VectorDbService {
     );
     final promptPattern = RegExp(r'^[\$#>]\s+[a-z0-9_-]', caseSensitive: false);
     final pathPattern = RegExp(r'^(?:\/|[a-zA-Z]:\\|\.\/|\.\.\/)');
-    final treePattern = RegExp(r'[├──└──│\+\-\-\|]');
+    final treePattern = RegExp(r'[├──└──│\+\|]');
     final tableHashPattern = RegExp(r'\b[0-9a-f]{12,64}\b');
-    final diagramArrowPattern = RegExp(r'(-->|<--|==>|<==|->|<-|──>|<──|─>|<─)');
+    final diagramArrowPattern = RegExp(r'(-->|<--|==>|<==|──>|<──)');
     final diagramBoxPattern = RegExp(r'(\+[-=]+\+|\+[-=]+|\|[-=]+\|)');
-    final tocTrailPattern = RegExp(r'(?:\.{2,}|\s{3,})\s*\d+\s*$|^(?:chapter|section|\d+\.\d+)\b', caseSensitive: false);
+    final tocTrailPattern = RegExp(r'(?:\.{3,})\s*\d+\s*$', caseSensitive: false);
     final hashBlockPattern = RegExp(r'\b(?:sha256:)?[0-9a-f]{32,64}\b', caseSensitive: false);
 
     for (final line in lines) {
@@ -214,7 +238,7 @@ class VectorDbService {
         commandCount++;
       } else if (pathPattern.hasMatch(line)) {
         isNoiseLine = true;
-      } else if (treePattern.hasMatch(line) && (line.contains('---') || line.contains('│') || line.contains('├──') || line.contains('└──'))) {
+      } else if (treePattern.hasMatch(line) && (line.contains('├──') || line.contains('└──') || line.contains('│   '))) {
         isNoiseLine = true;
         treeLineCount++;
       } else if (diagramArrowPattern.hasMatch(line) || diagramBoxPattern.hasMatch(line)) {
@@ -238,30 +262,23 @@ class VectorDbService {
       }
     }
 
-    // 1. If 3 or more distinct CLI command lines are present
+    // 1. If 3 or more distinct CLI command lines are present (installer scripts)
     if (commandCount >= 3) return true;
 
-    // 2. If it contains directory tree lines
-    if (treeLineCount >= 2) return true;
+    // 2. If 3 or more directory tree lines are present
+    if (treeLineCount >= 3) return true;
 
-    // 3. If diagram symbols, arrows, or pipeline box drawings are present (e.g. Wilson diagram dump)
-    if (diagramCount >= 2) return true;
+    // 3. If diagram drawings or pipeline box dumps dominate (>= 3)
+    if (diagramCount >= 3) return true;
 
-    // 4. If table of contents, chapter outlines, or dotted page number trails are present
-    if (tocLineCount >= 2) return true;
+    // 4. If table of contents dotted page number trails are present (>= 3)
+    if (tocTrailPattern.hasMatch(body) && tocLineCount >= 3) return true;
 
     // 5. If 3 or more sha256 / hex hashes are present without sufficient prose
     if (hashCount >= 3) return true;
 
-    // 6. If noise lines make up >= 25% of total lines
-    if (lines.length >= 3 && (noiseLineCount / lines.length) >= 0.25) return true;
-
-    // 7. Check for lack of prose in conceptual answers: chunks over 150 chars with fewer than 2 sentences
-    final proseSentences = text
-        .split(RegExp(r'(?<=[.!?])\s+'))
-        .where((s) => s.trim().split(RegExp(r'\s+')).length >= 5)
-        .length;
-    if (text.length > 150 && proseSentences < 2 && noiseLineCount >= 1) return true;
+    // 6. If noise lines make up >= 50% of total lines in a script dump
+    if (lines.length >= 4 && (noiseLineCount / lines.length) >= 0.50) return true;
 
     return false;
   }
@@ -341,6 +358,9 @@ class VectorDbService {
   static bool isPersonOrCitationFalsePositive(String text, String? entityAnchor) =>
       _isPersonOrCitationFalsePositive(text, entityAnchor);
 
+  @visibleForTesting
+  static bool isChunkTechnicalNoise(String text) => _isChunkTechnicalNoise(text);
+
   static List<Map<String, dynamic>> _filterNoiseCandidates(
     List<Map<String, dynamic>> candidates, {
     String queryText = '',
@@ -348,20 +368,15 @@ class VectorDbService {
   }) {
     if (candidates.isEmpty) return [];
 
-    final bestBm25 = -(candidates.first['score'] as num).toDouble();
-    final relevanceFloor = (bestBm25 * 0.15).clamp(2.0, 5.0);
     final isConceptual = isConceptualQuery(queryText);
 
     return candidates.where((c) {
-      final bm25 = -(c['score'] as num).toDouble();
-      if (bm25 < relevanceFloor) return false;
-
       final rawContent = c['content'] as String;
       final content = rawContent.toLowerCase();
 
       // Filter out Table of Contents, Index, and Front Matter
       if (content.contains('table of contents') || content.contains('contents at a glance')) return false;
-      if (RegExp(r'chapter\s+\d+.*chapter\s+\d+', dotAll: true).hasMatch(content)) return false;
+      if (RegExp(r'^\s*chapter\s+\d+[:\s].*\n\s*chapter\s+\d+[:\s]', multiLine: true).hasMatch(content)) return false;
       if (RegExp(r'\.{3,}\s*\d+').allMatches(content).length >= 2) return false;
       if (content.contains('index') && RegExp(r'\b\d{2,3},\s*\d{2,3}\b').hasMatch(content)) return false;
       if (content.contains('all rights reserved') && content.contains('isbn')) return false;
@@ -406,19 +421,50 @@ class VectorDbService {
       'to', 'for', 'of', 'with', 'by', 'and', 'or', 'about', 'can', 'could',
       'would', 'should', 'work', 'works', 'working', 'explain', 'tell', 'me'
     };
+    const typoCorrections = {
+      'accomodate': 'accommodate',
+      'accomodates': 'accommodates',
+      'accomodated': 'accommodated',
+      'accomodating': 'accommodating',
+      'seperate': 'separate',
+      'seperated': 'separated',
+      'seperates': 'separates',
+      'seperating': 'separating',
+      'postgress': 'postgres',
+      'refered': 'referred',
+      'occured': 'occurred',
+      'unstructred': 'unstructured',
+      'warehous': 'warehouse',
+      'warehouss': 'warehouses',
+      'architechture': 'architecture',
+      'architechtures': 'architectures',
+      'infrastucture': 'infrastructure',
+    };
     final words = queryText
         .replaceAll(RegExp(r'[^\w\s]'), ' ')
         .trim()
         .toLowerCase()
         .split(RegExp(r'\s+'))
         .where((w) => w.length > 1)
+        .map((w) => typoCorrections[w] ?? w)
         .toList();
     final contentWords = words.where((w) => !stopWords.contains(w)).toList();
     final queryTerms = contentWords.isNotEmpty ? contentWords : words;
     if (queryTerms.isEmpty) return [];
 
     try {
-      List<Map<String, dynamic>> rows = [];
+      final seenTexts = <String>{};
+      final rows = <Map<String, dynamic>>[];
+
+      void addUniqueRows(List<Map<String, dynamic>> newRows) {
+        for (final r in newRows) {
+          final txt = r['text_content'] as String? ?? '';
+          if (txt.isNotEmpty && !seenTexts.contains(txt)) {
+            seenTexts.add(txt);
+            rows.add(r);
+          }
+        }
+      }
 
       // If an entity anchor is provided or the query starts with an entity word:
       final anchor = entityAnchor?.trim().toLowerCase();
@@ -440,79 +486,83 @@ class VectorDbService {
               ? '"${anchorWords.first}"'
               : '(${anchorWords.map((w) => '"$w"').join(' AND ')})';
 
+          const vendorPrefixes = {'apache', 'gnu', 'project', 'open', 'the'};
+          final distinctiveWords = anchorWords.where((w) => !vendorPrefixes.contains(w.toLowerCase())).toList();
+          final primaryAnchorWord = distinctiveWords.isNotEmpty ? distinctiveWords.last : anchorWords.first;
+
           final otherTerms = queryTerms.where((w) => !anchorWords.contains(w)).toList();
           if (otherTerms.isNotEmpty) {
-            // Pass 1: Chunks containing all terms of the core entity AND any facet terms
+            // Pass 1: Chunks containing anchor AND other terms
             final anchoredQuery = '$anchorClause AND (${otherTerms.map((w) => '"$w"').join(" OR ")})';
             try {
-              rows = await _db!.rawQuery('''
+              final aRows = await _db!.rawQuery('''
                 SELECT text_content, metadata, bm25(document_chunks) as score
                 FROM document_chunks 
                 WHERE space_id = ? AND document_chunks MATCH ? 
                 ORDER BY score ASC
                 LIMIT ?
               ''', [spaceId, anchoredQuery, candidatePool]);
+              addUniqueRows(aRows);
             } catch (_) {}
-          }
 
-          // Pass 2: If under candidatePool, supplement with any chunk mentioning the core entity
-          if (rows.length < candidatePool) {
-            final needed = candidatePool - rows.length;
-            try {
-              final entityOnlyRows = await _db!.rawQuery('''
-                SELECT text_content, metadata, bm25(document_chunks) as score
-                FROM document_chunks 
-                WHERE space_id = ? AND document_chunks MATCH ? 
-                ORDER BY score ASC
-                LIMIT ?
-              ''', [spaceId, anchorClause, needed]);
-              
-              final seenTexts = rows.map((r) => r['text_content']).toSet();
-              for (final r in entityOnlyRows) {
-                if (!seenTexts.contains(r['text_content'])) {
-                  rows.add(r);
-                }
-              }
-            } catch (_) {}
-          }
-
-          // Pass 3: If multi-word entity still produced fewer than 10 candidates, try OR across anchor words
-          if (rows.length < 10 && anchorWords.length > 1) {
-            final needed = candidatePool - rows.length;
-            final relaxedAnchor = '(${anchorWords.map((w) => '"$w"').join(' OR ')})';
-            try {
-              final relaxedRows = await _db!.rawQuery('''
-                SELECT text_content, metadata, bm25(document_chunks) as score
-                FROM document_chunks 
-                WHERE space_id = ? AND document_chunks MATCH ? 
-                ORDER BY score ASC
-                LIMIT ?
-              ''', [spaceId, relaxedAnchor, needed]);
-              
-              final seenTexts = rows.map((r) => r['text_content']).toSet();
-              for (final r in relaxedRows) {
-                if (!seenTexts.contains(r['text_content'])) {
-                  rows.add(r);
-                }
-              }
-            } catch (_) {}
+            // Pass 1b: Distinctive subject word AND other terms
+            if (rows.length < candidatePool && anchorWords.length > 1) {
+              final distinctiveQuery = '"$primaryAnchorWord" AND (${otherTerms.map((w) => '"$w"').join(" OR ")})';
+              try {
+                final dRows = await _db!.rawQuery('''
+                  SELECT text_content, metadata, bm25(document_chunks) as score
+                  FROM document_chunks 
+                  WHERE space_id = ? AND document_chunks MATCH ? 
+                  ORDER BY score ASC
+                  LIMIT ?
+                ''', [spaceId, distinctiveQuery, candidatePool]);
+                addUniqueRows(dRows);
+              } catch (_) {}
+            }
           }
         }
       }
 
-      // Fallback: If still empty (e.g. entity not in space or generic query), run standard OR match
-      if (rows.isEmpty) {
+      // Pass 2 (Broad BM25 matching like OG backend): Always query all content terms with OR
+      if (rows.length < candidatePool * 2) {
         final cleanQuery = queryTerms.map((w) => '"$w"').join(' OR ');
-        rows = await _db!.rawQuery('''
-          SELECT text_content, metadata, bm25(document_chunks) as score
-          FROM document_chunks 
-          WHERE space_id = ? AND document_chunks MATCH ? 
-          ORDER BY score ASC
-          LIMIT ?
-        ''', [spaceId, cleanQuery, candidatePool]);
+        try {
+          final broadRows = await _db!.rawQuery('''
+            SELECT text_content, metadata, bm25(document_chunks) as score
+            FROM document_chunks 
+            WHERE space_id = ? AND document_chunks MATCH ? 
+            ORDER BY score ASC
+            LIMIT ?
+          ''', [spaceId, cleanQuery, candidatePool * 2]);
+          addUniqueRows(broadRows);
+        } catch (_) {}
       }
 
-      final candidates = rows.map((row) => {
+      // Pass 3 (Fuzzy Prefix Fallback): Handle typos, inflections, and stem mismatches
+      if (rows.length < 15) {
+        final prefixQuery = queryTerms
+            .where((w) => w.length >= 4)
+            .map((w) => '"${w.substring(0, math.min(w.length, 6))}"*')
+            .join(' OR ');
+        if (prefixQuery.isNotEmpty) {
+          try {
+            final prefixRows = await _db!.rawQuery('''
+              SELECT text_content, metadata, bm25(document_chunks) as score
+              FROM document_chunks 
+              WHERE space_id = ? AND document_chunks MATCH ? 
+              ORDER BY score ASC
+              LIMIT ?
+            ''', [spaceId, prefixQuery, candidatePool]);
+            addUniqueRows(prefixRows);
+          } catch (_) {}
+        }
+      }
+
+      // Re-sort all candidate rows by SQLite FTS5 bm25 score (smaller / more negative = higher relevance)
+      rows.sort((a, b) => (a['score'] as num).compareTo(b['score'] as num));
+      final finalRows = rows.take(candidatePool).toList();
+
+      final candidates = finalRows.map((row) => {
         'content': row['text_content'],
         'metadata': jsonDecode(row['metadata'] as String),
         'score': row['score'],

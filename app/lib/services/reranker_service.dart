@@ -12,6 +12,7 @@ class RerankResult {
   final String? closestSource;
   final List<String> missingFacets;
   final List<Map<String, dynamic>> unusedCandidates;
+  final bool isPartialMatch;
 
   RerankResult({
     required this.rankedCandidates,
@@ -20,6 +21,7 @@ class RerankResult {
     this.closestSource,
     this.missingFacets = const [],
     this.unusedCandidates = const [],
+    this.isPartialMatch = false,
   });
 }
 
@@ -178,10 +180,13 @@ class RerankerService {
   /// Reranks candidates per facet to guarantee wide architectural coverage.
   /// For each facet, scores candidate chunks against that specific facet query and
   /// selects the top 1-2 chunks above threshold while enforcing per-source caps.
+  /// Reranks candidates per facet to guarantee wide architectural coverage.
+  /// For each facet, scores candidate chunks against that specific facet query and
+  /// selects the top 1-2 chunks above threshold while enforcing per-source caps.
   static Future<RerankResult> rerankFacets(
     List<Map<String, dynamic>> facetRequests, {
     int targetCount = 4,
-    double cutoffThreshold = -0.5,
+    double cutoffThreshold = -4.0,
   }) async {
     if (facetRequests.isEmpty) {
       return RerankResult(
@@ -199,8 +204,9 @@ class RerankerService {
     double highestScore = double.negativeInfinity;
     String? closestSource;
 
-    // Strict per-book cap to ensure diversity across distinct books in the library
-    final maxPerBook = math.min(2, (targetCount / 2).ceil());
+    // Soft per-book cap: allow up to max(3, (targetCount * 0.65).ceil()) per book
+    // so an authoritative book can contribute 3-4 rich chunks without being arbitrarily capped at 2
+    final maxPerBook = math.max(3, (targetCount * 0.65).ceil());
 
     final scoredByFacet = <String, List<Map<String, dynamic>>>{};
 
@@ -228,13 +234,42 @@ class RerankerService {
       }
     }
 
-    // Step 2: Compute effective cutoff with relative score drop (drop chunks lagging > 3.2 behind best)
-    final relativeCutoff = (highestScore != double.negativeInfinity)
-        ? highestScore - 3.2
-        : cutoffThreshold;
-    final effectiveCutoff = math.max(cutoffThreshold, relativeCutoff);
+    // Step 2: Soft gate - if top score < -1.5, mark partial match
+    var isPartialMatch = highestScore < -1.5;
+    final effectiveTargetCount = targetCount;
 
-    // Pass 1: Select top chunk for each facet above effective cutoff
+    final relativeCutoff = (highestScore != double.negativeInfinity)
+        ? highestScore - 4.0
+        : cutoffThreshold;
+    final effectiveCutoff = (highestScore != double.negativeInfinity && highestScore < cutoffThreshold)
+        ? relativeCutoff
+        : math.max(cutoffThreshold, relativeCutoff);
+
+    // Collect all competitive candidates across all facets
+    final allCompetitive = <Map<String, dynamic>>[];
+    final allScored = <Map<String, dynamic>>[];
+    for (final entry in scoredByFacet.entries) {
+      final label = entry.key;
+      for (final cand in entry.value) {
+        final copy = Map<String, dynamic>.from(cand);
+        copy['facet_label'] = label;
+        allScored.add(copy);
+
+        final score = (cand['rerank_score'] as num).toDouble();
+        if (_isInitialized && score < effectiveCutoff) continue;
+        allCompetitive.add(copy);
+      }
+    }
+
+    allCompetitive.sort((a, b) {
+      final sA = (a['rerank_score'] as num).toDouble();
+      final sB = (b['rerank_score'] as num).toDouble();
+      return sB.compareTo(sA);
+    });
+
+    final facetCount = <String, int>{};
+
+    // Pass 1 (Diversity): Select top chunk for each facet only if competitive (within 4.0 of highestScore)
     for (final facet in facetRequests) {
       final label = facet['label'] as String? ?? 'General';
       final query = (facet['rerankQuery'] ?? facet['query'] ?? facet['bm25Query']) as String;
@@ -243,7 +278,9 @@ class RerankerService {
       Map<String, dynamic>? chosen;
       for (final cand in scored) {
         final score = (cand['rerank_score'] as num).toDouble();
-        if (_isInitialized && score < effectiveCutoff) continue;
+        if (_isInitialized && (score < effectiveCutoff || (highestScore != double.negativeInfinity && score < highestScore - 4.0))) {
+          continue;
+        }
 
         final content = cand['content'] as String;
         if (seenContent.contains(content)) continue;
@@ -262,6 +299,7 @@ class RerankerService {
         seenContent.add(content);
         sectionCount[sectionKey] = (sectionCount[sectionKey] ?? 0) + 1;
         bookCount[book] = (bookCount[book] ?? 0) + 1;
+        facetCount[label] = (facetCount[label] ?? 0) + 1;
         break;
       }
 
@@ -273,52 +311,81 @@ class RerankerService {
       } else {
         missingFacets.add(label);
       }
-
-      if (selected.length >= targetCount) break;
     }
 
-    // Pass 2: If under targetCount, fill remaining slots with highest scoring remaining chunks above cutoff
-    if (selected.length < targetCount) {
-      final remaining = <Map<String, dynamic>>[];
-      for (final entry in scoredByFacet.entries) {
-        final label = entry.key;
-        for (final cand in entry.value) {
-          final content = cand['content'] as String;
-          if (seenContent.contains(content)) continue;
-          final score = (cand['rerank_score'] as num).toDouble();
-          if (_isInitialized && score < effectiveCutoff) continue;
+    // Pass 2 (Depth): Fill remaining slots up to effectiveTargetCount with highest scoring candidates
+    for (final cand in allCompetitive) {
+      if (selected.length >= effectiveTargetCount) break;
+      final content = cand['content'] as String;
+      if (seenContent.contains(content)) continue;
 
-          final candCopy = Map<String, dynamic>.from(cand);
-          candCopy['facet_label'] = label;
-          candCopy['facet_query'] = candCopy['facet_query'] ?? label;
-          remaining.add(candCopy);
+      final label = cand['facet_label'] as String? ?? 'General';
+      if ((facetCount[label] ?? 0) >= 2) continue;
+
+      final meta = cand['metadata'] as Map<String, dynamic>? ?? {};
+      final book = (meta['virtual_filename'] ?? 'unknown') as String;
+      final chunkIdx = (meta['chunk_index'] ?? 0) as int;
+      final sectionKey = '${book}_${chunkIdx ~/ 5}';
+
+      if ((sectionCount[sectionKey] ?? 0) >= 2) continue;
+      if ((bookCount[book] ?? 0) >= maxPerBook) continue;
+
+      seenContent.add(content);
+      sectionCount[sectionKey] = (sectionCount[sectionKey] ?? 0) + 1;
+      bookCount[book] = (bookCount[book] ?? 0) + 1;
+      facetCount[label] = (facetCount[label] ?? 0) + 1;
+      selected.add(cand);
+    }
+
+    // Book Diversity: If candidates from >= 2 distinct books are competitive, guarantee multi-book synthesis
+    final competitiveBooks = allCompetitive.map((c) {
+      final meta = c['metadata'] as Map<String, dynamic>? ?? {};
+      return (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+    }).toSet();
+
+    if (competitiveBooks.length >= 2) {
+      final selectedBooks = selected.map((c) {
+        final meta = c['metadata'] as Map<String, dynamic>? ?? {};
+        return (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+      }).toSet();
+
+      if (selectedBooks.length < 2) {
+        for (final cand in allCompetitive) {
+          final meta = cand['metadata'] as Map<String, dynamic>? ?? {};
+          final b = (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+          if (!selectedBooks.contains(b)) {
+            if (selected.length >= effectiveTargetCount && selected.isNotEmpty) {
+              selected.removeLast();
+            }
+            selected.add(cand);
+            break;
+          }
         }
       }
+    }
 
-      remaining.sort((a, b) {
-        final scoreA = (a['rerank_score'] as num).toDouble();
-        final scoreB = (b['rerank_score'] as num).toDouble();
-        return scoreB.compareTo(scoreA);
-      });
-
-      for (final cand in remaining) {
-        if (selected.length >= targetCount) break;
+    // Pass 3 (Relax Caps): If under effectiveTargetCount, relax per-book and per-section caps to fill slots
+    if (selected.length < effectiveTargetCount) {
+      for (final cand in allCompetitive) {
+        if (selected.length >= effectiveTargetCount) break;
         final content = cand['content'] as String;
         if (seenContent.contains(content)) continue;
-
-        final meta = cand['metadata'] as Map<String, dynamic>? ?? {};
-        final book = (meta['virtual_filename'] ?? 'unknown') as String;
-        final chunkIdx = (meta['chunk_index'] ?? 0) as int;
-        final sectionKey = '${book}_${chunkIdx ~/ 5}';
-
-        if ((sectionCount[sectionKey] ?? 0) >= 2) continue;
-        if ((bookCount[book] ?? 0) >= maxPerBook) continue;
-
         seenContent.add(content);
-        sectionCount[sectionKey] = (sectionCount[sectionKey] ?? 0) + 1;
-        bookCount[book] = (bookCount[book] ?? 0) + 1;
         selected.add(cand);
       }
+    }
+
+    // Pass 4 (OG Threshold Fallback): If still empty, take top-ranked candidates rather than refusing
+    if (selected.isEmpty && allScored.isNotEmpty) {
+      allScored.sort((a, b) => (b['rerank_score'] as num).compareTo(a['rerank_score'] as num));
+      for (final cand in allScored) {
+        if (selected.length >= effectiveTargetCount) break;
+        final content = cand['content'] as String;
+        if (seenContent.contains(content)) continue;
+        seenContent.add(content);
+        selected.add(cand);
+      }
+      isPartialMatch = true;
     }
 
     final unused = <Map<String, dynamic>>[];
@@ -334,7 +401,7 @@ class RerankerService {
       }
     }
 
-    final isCovered = selected.isNotEmpty && (highestScore >= effectiveCutoff || !_isInitialized);
+    final isCovered = selected.isNotEmpty;
 
     return RerankResult(
       rankedCandidates: selected,
@@ -343,6 +410,7 @@ class RerankerService {
       closestSource: closestSource,
       missingFacets: missingFacets,
       unusedCandidates: unused,
+      isPartialMatch: isPartialMatch,
     );
   }
 
@@ -352,7 +420,7 @@ class RerankerService {
     String query,
     List<Map<String, dynamic>> candidates, {
     int targetCount = 4,
-    double cutoffThreshold = -0.5,
+    double cutoffThreshold = -4.0,
   }) async {
     if (candidates.isEmpty) {
       return RerankResult(
@@ -385,33 +453,25 @@ class RerankerService {
       );
     }
 
-    // Relative cutoff: drop any chunk lagging > 3.2 points below the best score
-    final relativeCutoff = (topScore != double.negativeInfinity)
-        ? topScore - 3.2
-        : cutoffThreshold;
-    final effectiveCutoff = math.max(cutoffThreshold, relativeCutoff);
+    // Soft gate: if top score < -1.5, mark partial match
+    var isPartialMatch = topScore < -1.5;
+    final effectiveTargetCount = targetCount;
 
-    // Absolute threshold gating
-    final isCovered = topScore >= effectiveCutoff || !_isInitialized;
-    if (!isCovered) {
-      debugPrint('RAG Gate: Out-of-coverage! Top score $topScore < cutoff $effectiveCutoff');
-      return RerankResult(
-        rankedCandidates: [],
-        isCovered: false,
-        topScore: topScore,
-        closestSource: closestSource,
-      );
-    }
+    final relativeCutoff = (topScore != double.negativeInfinity)
+        ? topScore - 4.0
+        : cutoffThreshold;
+    final effectiveCutoff = (topScore != double.negativeInfinity && topScore < cutoffThreshold)
+        ? relativeCutoff
+        : math.max(cutoffThreshold, relativeCutoff);
 
     // Per-source caps
     final selected = <Map<String, dynamic>>[];
     final bookCount = <String, int>{};
     final sectionCount = <String, int>{};
-    // Strict per-book cap to ensure diversity across distinct books in the library
-    final maxPerBook = math.min(2, (targetCount / 2).ceil());
+    final maxPerBook = math.max(3, (effectiveTargetCount / 2).ceil());
 
     for (final cand in scoredList) {
-      if (selected.length >= targetCount) break;
+      if (selected.length >= effectiveTargetCount) break;
 
       final score = (cand['rerank_score'] as num).toDouble();
       if (_isInitialized && score < effectiveCutoff) continue;
@@ -429,16 +489,65 @@ class RerankerService {
       bookCount[book] = (bookCount[book] ?? 0) + 1;
     }
 
+    // OG Cap Relaxation: If under effectiveTargetCount, fill remaining slots from scoredList
+    if (selected.length < effectiveTargetCount) {
+      for (final cand in scoredList) {
+        if (selected.length >= effectiveTargetCount) break;
+        if (selected.contains(cand)) continue;
+        final score = (cand['rerank_score'] as num).toDouble();
+        if (_isInitialized && score < effectiveCutoff) continue;
+        selected.add(cand);
+      }
+    }
+
+    // Book Diversity: If competitive candidates exist from >= 2 books, ensure at least 2 distinct books
+    final competitiveCandidates = scoredList.where((c) => (c['rerank_score'] as num) >= effectiveCutoff).toList();
+    final competitiveBooks = competitiveCandidates.map((c) {
+      final meta = c['metadata'] as Map<String, dynamic>? ?? {};
+      return (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+    }).toSet();
+
+    if (competitiveBooks.length >= 2) {
+      final selectedBooks = selected.map((c) {
+        final meta = c['metadata'] as Map<String, dynamic>? ?? {};
+        return (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+      }).toSet();
+
+      if (selectedBooks.length < 2) {
+        for (final cand in competitiveCandidates) {
+          final meta = cand['metadata'] as Map<String, dynamic>? ?? {};
+          final b = (meta['virtual_filename'] ?? meta['filename'] ?? 'unknown') as String;
+          if (!selectedBooks.contains(b)) {
+            if (selected.length >= effectiveTargetCount && selected.isNotEmpty) {
+              selected.removeLast();
+            }
+            selected.add(cand);
+            break;
+          }
+        }
+      }
+    }
+
+    // OG Threshold Fallback: If still empty (all candidates fell below cutoff), take top candidates anyway
+    if (selected.isEmpty && scoredList.isNotEmpty) {
+      for (final cand in scoredList) {
+        if (selected.length >= effectiveTargetCount) break;
+        selected.add(cand);
+      }
+      isPartialMatch = true;
+    }
+
     final unused = scoredList
         .where((c) => !selected.contains(c) && (c['rerank_score'] as num) >= effectiveCutoff)
         .toList();
 
     return RerankResult(
       rankedCandidates: selected,
-      isCovered: true,
+      isCovered: selected.isNotEmpty,
       topScore: topScore,
       closestSource: closestSource,
       unusedCandidates: unused,
+      isPartialMatch: isPartialMatch,
     );
   }
 

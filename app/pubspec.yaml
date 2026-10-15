@@ -71,6 +71,8 @@ dependencies:
   sqflite_common_ffi: ^2.4.3
   flutter_onnxruntime: ^1.9.0
   flutter_litert_lm: ^0.3.0
+  google_mlkit_text_recognition: ^0.17.1
+  pdfx: ^2.6.0
 
 dev_dependencies:
   flutter_test:

@@ -126,13 +126,14 @@ class OnlineLlmService {
     final lastUserMsg = history.lastWhere((msg) => msg.role == 'user', orElse: () => history.last);
     final userQuery = lastUserMsg.content;
     final uc = explicitUseCase ?? PromptBuilder.inferUseCase(userQuery);
+    final scope = PromptBuilder.extractScopePhrase(userQuery);
 
     // Build the identical prompt structure used by the local on-device pipeline
     final preparedChunks = PromptBuilder.prepareChunks(safeChunks, userQuery);
-    final systemText = PromptBuilder.buildSystemPrompt(uc, chunks: preparedChunks);
-    final userPromptText = PromptBuilder.buildUserMessage(userQuery, preparedChunks, uc);
+    final systemText = PromptBuilder.buildSystemPrompt(uc, chunks: preparedChunks, scope: scope);
+    final userPromptText = PromptBuilder.buildUserMessage(userQuery, preparedChunks, uc, scope: scope);
 
-    print('\n================ EXACT ONLINE GEMINI PROMPT DUMP (model=$model, use_case=$uc) ================');
+    print('\n================ EXACT ONLINE GEMINI PROMPT DUMP (model=$model, use_case=$uc, scope=$scope) ================');
     print('--- SYSTEM INSTRUCTION ---');
     print(systemText);
     print('--- USER PROMPT ---');

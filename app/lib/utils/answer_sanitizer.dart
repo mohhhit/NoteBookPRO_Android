@@ -42,6 +42,8 @@ class AnswerSanitizer {
     text = normalizeFormulaEquations(text);
     text = _dropArtifactLines(text);
     text = correctSchemaOverstatements(text);
+    text = correctTechnicalContradictions(text);
+    text = sanitizeInformalTropes(text);
     text = text.replaceAll(RegExp(r'\n{3,}'), '\n\n').trim();
     text = repairMarkdownTables(text);
 
@@ -321,8 +323,16 @@ class AnswerSanitizer {
     if (text.isEmpty) return text;
     var out = text;
     out = out.replaceAll(
+      RegExp(r'\bto\s+(?:guarantee|ensure)\s+(?:complete\s+|absolute\s+)?data\s+correctness\b', caseSensitive: false),
+      'to enforce structural schema constraints',
+    );
+    out = out.replaceAll(
       RegExp(r'\b(?:guarantees?|ensures?)\s+(?:complete\s+|absolute\s+)?data\s+correctness\b', caseSensitive: false),
       'enforces structural schema constraints',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bto\s+enforces\b', caseSensitive: false),
+      'to enforce',
     );
     out = out.replaceAll(
       RegExp(r'\b(?:guarantees?|ensures?)\s+(?:the\s+)?(?:semantic\s+)?accuracy\s+of\s+(?:the\s+)?data\b', caseSensitive: false),
@@ -342,5 +352,160 @@ class AnswerSanitizer {
     );
     return out;
   }
+
+  /// Corrects common technical contradictions or inverted concepts.
+  static String correctTechnicalContradictions(String text) {
+    if (text.isEmpty) return text;
+    var out = text;
+
+    // Correct schema-on-read write attribution:
+    // With schema-on-read, the structure of the data is interpreted when it is read,
+    // rather than being fully enforced before storage.
+    out = out.replaceAll(
+      RegExp(r'\b(?:the\s+)?schema\s+is\s+(?:dynamically\s+)?created\s+when\s+data\s+is\s+written\b', caseSensitive: false),
+      'the structure is interpreted when data is read rather than enforced before storage',
+    );
+    out = out.replaceAll(
+      RegExp(r'\b(?:the\s+)?schema\s+is\s+(?:dynamically\s+)?applied\s+when\s+data\s+is\s+written\b', caseSensitive: false),
+      'the structure is interpreted when data is read rather than enforced before storage',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bschema-on-read\b[^\.\n]*?\bwhen\s+data\s+is\s+written\b', caseSensitive: false),
+      'schema-on-read, where structure is interpreted when data is read rather than enforced before storage',
+    );
+
+    // Correct overbroad format transcoding claims:
+    // Conversion between columnar and record formats involves schema mapping and serialization,
+    // not direct transcoding without processing.
+    out = out.replaceAll(
+      RegExp(r'\bdirectly\s+transcoded\s+(?:between|across)\s+formats(?:\s+without\s+processing)?\b', caseSensitive: false),
+      'converted across formats using schema mapping and processing engines',
+    );
+    out = out.replaceAll(
+      RegExp(r'\btranscoded\s+(?:between|across)\s+formats\s+without\s+processing\b', caseSensitive: false),
+      'converted across formats using schema mapping and processing engines',
+    );
+    out = out.replaceAll(
+      RegExp(r'\btranscoded\s+without\s+processing\b', caseSensitive: false),
+      'converted using schema mapping and serialization',
+    );
+
+    // Neutralize definitions subordinating data lake to lakehouse:
+    // Data lake must be defined as an independent repository, not merely a storage tier of a lakehouse.
+    out = out.replaceAll(
+      RegExp(r'\b(?:is\s+)?(?:primarily\s+)?(?:designed\s+as\s+|serves\s+as\s+|acts\s+as\s+)(?:the\s+)?(?:bottom\s+|underlying\s+)?storage\s+(?:layer|foundation)\s+of\s+a\s+lakehouse\b', caseSensitive: false),
+      'is a centralized repository for storing raw, structured, semistructured, and unstructured data at scale',
+    );
+
+    // Correct absolute "schema-less" claim with plural subject agreement:
+    // Data lakes are not strictly schema-less; they decouple schema definition from storage and use schema-on-read.
+    out = out.replaceAllMapped(
+      RegExp(r'\b(lakes?|repositories|systems|stores)\s+remains?\s+schema-less\b', caseSensitive: false),
+      (m) {
+        final subj = m.group(1)!;
+        final verb = subj.toLowerCase().endsWith('s') ? 'employ' : 'employs';
+        return '$subj $verb schema-on-read rather than rigid write-time enforcement';
+      },
+    );
+    out = out.replaceAll(
+      RegExp(r'\bdata\s+lakes?\s+(?:is|are|remain|remains)\s+(?:strictly\s+)?schema-less\b', caseSensitive: false),
+      'data lakes employ schema-on-read',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bstrictly\s+schema-less\b', caseSensitive: false),
+      'schema-flexible, employing schema-on-read',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bremain\s+schema-less\b', caseSensitive: false),
+      'employ schema-on-read rather than rigid write-time enforcement',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bremains\s+schema-less\b', caseSensitive: false),
+      'employs schema-on-read rather than rigid write-time enforcement',
+    );
+
+    // Scope transaction and isolation limitations to traditional data lakes:
+    out = out.replaceAll(
+      RegExp(r'\bdata\s+lakes\s+(?:lack|do\s+not\s+support)\s+(?:ACID\s+)?transactions\b', caseSensitive: false),
+      'traditional data lakes lacked native support for ACID transactions and isolation, though modern table formats introduce these capabilities',
+    );
+    out = out.replaceAll(
+      RegExp(r'\blacks?\s+(?:ACID\s+)?transactional\s+isolation\b', caseSensitive: false),
+      'traditionally lacked transactional isolation before the advent of modern table formats',
+    );
+
+    // Warehouse storage oversimplification (vertically scaled vs decoupled):
+    out = out.replaceAll(
+      RegExp(r'\bwarehouses\s+(?:only\s+)?rely\s+on\s+local(?:ly)?(?:,\s*|\s+)vertically\s+scaled\s+storage\b', caseSensitive: false),
+      'traditional warehouses utilized vertically coupled storage, whereas modern cloud warehouses and lakes decouple storage from compute',
+    );
+
+    return out;
+  }
+
+  /// Sanitizes informal author characterizations, cynical remarks, or vague colloquialisms.
+  static String sanitizeInformalTropes(String text) {
+    if (text.isEmpty) return text;
+    var out = text;
+
+    // Cynical / informal characterizations (e.g. author's "glorified distributed filesystem")
+    out = out.replaceAll(
+      RegExp(r'\b(?:a\s+)?glorified\s+distributed\s+filesystem\b', caseSensitive: false),
+      'distributed storage system',
+    );
+    out = out.replaceAllMapped(
+      RegExp(r'\b(?:just\s+a\s+|a\s+)?glorified\s+([a-zA-Z\s]+?)\b', caseSensitive: false),
+      (m) => '${m.group(1)}',
+    );
+
+    // Vague scaling colloquialisms
+    out = out.replaceAll(
+      RegExp(r'\bgrow\s+unbounded\s+over\s+time\b', caseSensitive: false),
+      'accommodate expanding data volumes across distributed storage',
+    );
+
+    // Author metaphor: "data swamp", "polluted or toxic"
+    out = out.replaceAll(
+      RegExp(r'\b(?:become\s+(?:a\s+)?)?(?:data\s+swamp[,\s]*)?(?:polluted\s+or\s+toxic|toxic\s+or\s+polluted)\b', caseSensitive: false),
+      'unmanaged and inconsistent due to lack of governance',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bdata\s+swamps?\b', caseSensitive: false),
+      'uncataloged and poorly governed data stores',
+    );
+
+    // Metaphorical conductor / orchestra characterizations
+    out = out.replaceAll(
+      RegExp(r'\b(?:acts\s+as\s+(?:an?\s+)?|functions\s+as\s+(?:an?\s+)?)?(?:orchestration\s+|orchestrator\s+)?conductor\s+of\s+an?\s+orchestra\b', caseSensitive: false),
+      'workflow orchestrator',
+    );
+    out = out.replaceAll(
+      RegExp(r'\b(?:orchestrator|orchestration)\s+conductor\b', caseSensitive: false),
+      'workflow orchestrator',
+    );
+    out = out.replaceAll(
+      RegExp(r'\b(?:acts\s+as\s+(?:an?\s+)?|functions\s+as\s+(?:an?\s+)?)conductor\s+(?:to\s+coordinate|coordinating)\b', caseSensitive: false),
+      'workflow orchestrator coordinating',
+    );
+
+    // Promotional author fluff: "harmonious results" / "harmonious pipeline"
+    out = out.replaceAll(
+      RegExp(r'\b(?:to\s+produce\s+|producing\s+|achieving\s+)?(?:a\s+)?harmonious\s+results?\b', caseSensitive: false),
+      'reliable pipeline execution',
+    );
+
+    // Vague pipeline phrases like "A-to-B operations"
+    out = out.replaceAll(
+      RegExp(r'\boperators\s+specific\s+to\s+perform\s+actions\s+and\s+A-to-B\s+operations\b', caseSensitive: false),
+      'operators designed to execute discrete tasks and data transfers',
+    );
+    out = out.replaceAll(
+      RegExp(r'\bA-to-B\s+operations?\b', caseSensitive: false),
+      'end-to-end task executions',
+    );
+
+    return out;
+  }
+
 
 }

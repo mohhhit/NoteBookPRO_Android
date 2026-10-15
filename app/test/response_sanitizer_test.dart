@@ -299,21 +299,39 @@ Jenkins is an automation server that executes pipelines triggered by source code
       expect(cleanWithEntity, equals('High Performance Spark'));
     });
 
-    test('buildFacetsForTopic generates comprehensive architectural facets for Data Lake', () {
-      final facets = AppState.buildFacetsForTopic('Explain Data Lake in detail');
-      expect(facets.length, equals(6));
-      expect(facets[0]['label'], contains('Raw Data'));
-      expect(facets[0]['bm25Query'], contains('unstructured'));
-      expect(facets[1]['label'], contains('Infrastructure'));
-      expect(facets[1]['bm25Query'], contains('Hadoop'));
-      expect(facets[2]['label'], contains('Formats'));
-      expect(facets[2]['bm25Query'], contains('Parquet'));
-      expect(facets[3]['label'], contains('Interoperability'));
-      expect(facets[3]['bm25Query'], contains('Spark'));
-      expect(facets[4]['label'], contains('Limitations'));
-      expect(facets[4]['bm25Query'], contains('transactional'));
-      expect(facets[5]['label'], contains('Lakehouses'));
-      expect(facets[5]['bm25Query'], contains('ACID'));
+    test('buildFacetsForTopic generates domain-agnostic universal facets without hardcoded topic terms', () {
+      final dlFacets = AppState.buildFacetsForTopic('Explain Data Lake in detail');
+      expect(dlFacets.length, equals(6));
+      expect(dlFacets[0]['label'], contains('Definition'));
+      expect(dlFacets[1]['label'], contains('Infrastructure'));
+      expect(dlFacets[2]['label'], contains('Formats'));
+      expect(dlFacets[3]['label'], contains('Interoperability'));
+      expect(dlFacets[4]['label'], contains('Limitations'));
+      expect(dlFacets[5]['label'], contains('Lifecycle'));
+
+      // Ensure queries with evolution keywords dynamically activate Evolution facet
+      final dlEvoFacets = AppState.buildFacetsForTopic('Explain the modern evolution of Data Lake');
+      expect(dlEvoFacets.length, equals(6));
+      expect(dlEvoFacets[5]['label'], contains('Evolution'));
+
+      // Ensure no specific technology names are hardcoded into the query generators
+      for (final f in dlFacets) {
+        expect(f['bm25Query'], isNot(contains('Hadoop')));
+        expect(f['bm25Query'], isNot(contains('Parquet')));
+        expect(f['bm25Query'], isNot(contains('Spark')));
+        expect(f['bm25Query'], isNot(contains('Lakehouse')));
+      }
+
+      // Verify that another entity generates cleanly without any data lake leakage
+      final jenkinsFacets = AppState.buildFacetsForTopic('Explain Jenkins in detail');
+      expect(jenkinsFacets.length, equals(6));
+      expect(jenkinsFacets[0]['bm25Query'], contains('Jenkins'));
+      expect(jenkinsFacets[5]['label'], contains('Lifecycle'));
+      for (final f in jenkinsFacets) {
+        expect(f['bm25Query'], isNot(contains('Hadoop')));
+        expect(f['bm25Query'], isNot(contains('Parquet')));
+        expect(f['bm25Query'], isNot(contains('Lakehouse')));
+      }
     });
 
     test('enforceCitationsAndCleanOutput preserves multi-section architectural headings and bullets', () {
@@ -420,6 +438,27 @@ Key differences between the data lake and a data warehouse include:
 
       // Substantive bullet MUST be preserved
       expect(output, contains('**Schema Strategy**: A data warehouse enforces schema-on-write'));
+    });
+
+    test('enforceCitationsAndCleanOutput replaces poorly matched model citation with best matching chunk', () {
+      const chunk1 = 'General data storage and retrieval systems.';
+      const chunk2 = 'Data processing engines execute batch workflows across worker nodes.';
+      const chunk3 = 'Columnar layouts such as Parquet, Avro, Arrow, and ORC optimize compression and nested record serialization.';
+
+      const input = '''
+### Data Formats
+* **Columnar Formats**: Systems utilize Parquet, Avro, Arrow, and ORC to optimize compression and nested record serialization [2].
+''';
+
+      final output = AppState.enforceCitationsAndCleanOutput(
+        input,
+        rawChunks: [chunk1, chunk2, chunk3],
+      );
+
+      // Model cited [2] (which only had weak matches), but chunk [3] has overwhelming keyword matches.
+      // The citation must be corrected to [3].
+      expect(output, contains('[3].'));
+      expect(output, isNot(contains('[2].')));
     });
   });
 }
